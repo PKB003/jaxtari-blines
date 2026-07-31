@@ -1,0 +1,678 @@
+# Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/sac_continuous_action.py
+import os
+import random
+import time
+from functools import partial
+from typing import NamedTuple, Optional
+
+import flashbax as fbx
+import flax
+import flax.linen as nn
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import wandb
+from flax.linen.initializers import constant, orthogonal
+from flax.training.train_state import TrainState
+from jaxatari.wrappers import (
+    AtariWrapper,
+    PixelObsWrapper,
+    ObjectCentricWrapper,
+    LogWrapper,
+    FlattenObservationWrapper,
+    NormalizeObservationWrapper,
+    ContinuousActionWrapper,
+)
+from jaxatari import spaces
+
+from rtpt import RTPT
+from agents.sac.sac_eval import evaluate
+
+
+def make_env(
+    env_id: str,
+    mods: Optional[list] = None,
+    pixel_based: bool = True,
+    native_downscaling: bool = True,
+    eval: bool = False,
+    continuous_action: bool = True,
+    tau: float = 0.5,
+):
+    if mods is None:
+        mods = []
+    if not eval and len(mods) > 0:
+        print(f"[WARNING] Training on mods {mods}!")
+
+    def thunk():
+        import jaxatari
+        env = jaxatari.make(env_id, mods=mods)
+        env = AtariWrapper(
+            env,
+            sticky_actions=0.0,
+            episodic_life=not eval,
+            first_fire=True,
+            noop_max=30,
+            full_action_space=continuous_action,
+        )
+
+        if pixel_based:
+            env = PixelObsWrapper(
+                env,
+                do_pixel_resize=True,
+                pixel_resize_shape=(84, 84),
+                grayscale=True,
+                use_native_downscaling=native_downscaling,
+                smooth_image=False,
+                frame_stack_size=4,
+                frame_skip=4,
+                max_pooling=True,
+                clip_reward=not eval,
+            )
+        else:
+            env = FlattenObservationWrapper(
+                NormalizeObservationWrapper(
+                    ObjectCentricWrapper(
+                        env,
+                        frame_stack_size=4,
+                        frame_skip=4,
+                        clip_reward=not eval,
+                    )
+                )
+            )
+
+        env = LogWrapper(env)
+        if continuous_action:
+            env = ContinuousActionWrapper(env, tau=tau)
+
+        return env
+    return thunk
+
+
+# ---------- Networks ----------
+class Network(nn.Module):
+    """CNN for pixel observations."""
+    @nn.compact
+    def __call__(self, x):
+        x = jnp.transpose(x, (0, 2, 3, 1))
+        x = x / (255.0)
+        x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
+                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, kernel_size=(4, 4), strides=(2, 2), padding="VALID",
+                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Conv(64, kernel_size=(3, 3), strides=(1, 1), padding="VALID",
+                    kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = x.reshape((x.shape[0], -1))
+        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        return x
+
+
+class MLP_Network(nn.Module):
+    """MLP for object-centric observations."""
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        return x
+
+
+class Actor(nn.Module):
+    """Gaussian policy for continuous actions."""
+    action_dim: int
+    log_std_min: float = -5.0   # CleanRL default
+    log_std_max: float = 2.0    # CleanRL default
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01))(x)
+        log_std = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01))(x)
+        # CleanRL-style tanh scaling: map tanh output [-1,1] -> [log_std_min, log_std_max]
+        log_std = jnp.tanh(log_std)
+        log_std = self.log_std_min + 0.5 * (self.log_std_max - self.log_std_min) * (log_std + 1)
+        return mean, log_std
+
+
+class SoftQNetwork(nn.Module):
+    """Q(s,a) network: takes hidden features + action, concatenates them."""
+    action_dim: int
+
+    @nn.compact
+    def __call__(self, x, a):
+        # Concatenate hidden features with action
+        x = jnp.concatenate([x, a], axis=-1)
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        return nn.Dense(1, kernel_init=orthogonal(1.0))(x)
+
+
+# ---------- All parameters in one NamedTuple ----------
+class AgentParams(NamedTuple):
+    network_params: flax.core.FrozenDict
+    actor_params: flax.core.FrozenDict
+    qf1_params: flax.core.FrozenDict
+    qf2_params: flax.core.FrozenDict
+    qf1_target_params: flax.core.FrozenDict
+    qf2_target_params: flax.core.FrozenDict
+
+
+@flax.struct.dataclass
+class Transition:
+    obs: jnp.ndarray
+    action: jnp.ndarray
+    reward: jnp.ndarray
+    next_obs: jnp.ndarray
+    done: jnp.ndarray
+
+
+def single_run(config: dict):
+    # Convert config to uppercase
+    config = {k.upper(): v for k, v in config.items() if k != "alg"}
+
+    if isinstance(config.get("TRAIN_MODS"), list):
+        config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
+    if isinstance(config.get("EVAL_MODS"), list):
+        config["EVAL_MODS"] = tuple(config["EVAL_MODS"])
+
+    run_name = f'{config["ENV_ID"]}_{config["EXP_NAME"]}_{"oc" if not config["PIXEL_BASED"] else "pixel"}_{config["SEED"]}'
+
+    wandb.init(
+        project=config.get("PROJECT", "jaxtari-blines"),
+        entity=config.get("ENTITY", None),
+        config=config,
+        name=run_name,
+        save_code=True,
+    )
+
+    # Seeding
+    random.seed(config["SEED"])
+    np.random.seed(config["SEED"])
+    key = jax.random.PRNGKey(config["SEED"])
+    key, network_key, actor_key, qf1_key, qf2_key = jax.random.split(key, 5)
+
+    # Environment
+    env = make_env(
+        config["ENV_ID"],
+        list(config.get("TRAIN_MODS", [])),
+        config["PIXEL_BASED"],
+        config.get("NATIVE_DOWNSCALING", True),
+        False,
+    )()
+    obs_space = env.observation_space()
+    assert isinstance(obs_space, spaces.Box), "SAC requires Box observation space."
+    action_space = env.action_space()
+    assert isinstance(action_space, spaces.Box), "ContinuousActionWrapper should give Box action space."
+    action_dim = action_space.shape[0]
+    low = jnp.array(action_space.low)
+    high = jnp.array(action_space.high)
+
+    # Vectorized environment wrappers
+    @jax.jit
+    def vmap_reset(key):
+        obs, state = jax.vmap(env.reset)(key)
+        return obs.squeeze(), state
+
+    @jax.jit
+    def vmap_step(state, action):
+        next_obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
+        next_done = jnp.logical_or(terminated, truncated)
+        return next_obs.squeeze(), state, reward, next_done, info
+
+    # Networks
+    NetworkClass = Network if config["PIXEL_BASED"] else MLP_Network
+    network = NetworkClass()
+    actor = Actor(action_dim=action_dim)
+    qf1 = SoftQNetwork(action_dim=action_dim)
+    qf2 = SoftQNetwork(action_dim=action_dim)
+
+    sample_obs = obs_space.sample(jax.random.PRNGKey(0)).squeeze()[None, ...]
+    network_params = network.init(network_key, sample_obs)
+    hidden = network.apply(network_params, sample_obs)
+    actor_params = actor.init(actor_key, hidden)
+    # For Q networks, we need a dummy action to init
+    dummy_action = jnp.zeros((1, action_dim))
+    qf1_params = qf1.init(qf1_key, hidden, dummy_action)
+    qf2_params = qf2.init(qf2_key, hidden, dummy_action)
+
+    # Target networks (initialized as copies)
+    qf1_target_params = qf1_params
+    qf2_target_params = qf2_params
+
+    # Separate optimizers
+    # Q-network optimizer
+    q_tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=config["Q_LR"], eps=1e-5),
+    )
+    # Policy + network encoder optimizer
+    policy_tx = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=config["POLICY_LR"], eps=1e-5),
+    )
+
+    # We use separate TrainStates for Q and policy
+    # Q networks share one optimizer
+    qf1_state = TrainState.create(apply_fn=None, params=qf1_params, tx=q_tx)
+    qf2_state = TrainState.create(apply_fn=None, params=qf2_params, tx=q_tx)
+    # Actor + network share another optimizer
+    actor_state = TrainState.create(apply_fn=None, params=actor_params, tx=policy_tx)
+    network_state = TrainState.create(apply_fn=None, params=network_params, tx=policy_tx)
+
+    # Replay buffer with flashbax
+    buffer = fbx.make_item_buffer(
+        max_length=config["BUFFER_SIZE"],
+        min_length=config["BATCH_SIZE"],
+        sample_batch_size=config["BATCH_SIZE"],
+        add_batches=True,
+        add_sequences=False,
+    )
+    buffer_state = buffer.init(jax.random.PRNGKey(0))
+
+    # Automatic entropy tuning
+    if config["AUTOTUNE"]:
+        target_entropy = -action_dim
+        log_alpha = jnp.zeros(1)
+        alpha_state = TrainState.create(
+            apply_fn=None,
+            params={"log_alpha": log_alpha},
+            tx=optax.adam(learning_rate=config["Q_LR"], eps=1e-5),  # CleanRL uses q_lr for alpha
+        )
+    else:
+        alpha = config["ALPHA"]
+        alpha_state = None
+
+    # ---------- JIT functions ----------
+
+    @jax.jit
+    def sample_action(network_params, actor_params, obs, key):
+        """Sample action from the policy (stochastic)."""
+        hidden = network.apply(network_params, obs)
+        mean, log_std = actor.apply(actor_params, hidden)
+        std = jnp.exp(log_std)
+        key, subkey = jax.random.split(key)
+        z = mean + std * jax.random.normal(subkey, shape=mean.shape)
+        action = jnp.tanh(z)
+        action_rescaled = low + (action + 1.0) * (high - low) / 2.0
+        return action_rescaled, key
+
+    @jax.jit
+    def get_det_action(network_params, actor_params, obs):
+        """Deterministic action (mean, no noise) for evaluation."""
+        hidden = network.apply(network_params, obs)
+        mean, _ = actor.apply(actor_params, hidden)
+        action = jnp.tanh(mean)
+        action_rescaled = low + (action + 1.0) * (high - low) / 2.0
+        return action_rescaled
+
+    # ---------- SAC update functions ----------
+
+    @jax.jit
+    def update_qf(
+        network_state, qf1_state, qf2_state,
+        qf1_target_params, qf2_target_params,
+        actor_state, alpha, batch, key,
+    ):
+        """Update Q-networks using MSE loss against target Q values."""
+        hidden = network.apply(network_state.params, batch.obs)
+        next_hidden = network.apply(network_state.params, batch.next_obs)
+
+        # Compute target Q (with torch.no_grad() equivalent)
+        next_mean, next_log_std = actor.apply(actor_state.params, next_hidden)
+        next_std = jnp.exp(next_log_std)
+        key, subkey = jax.random.split(key)
+        next_z = next_mean + next_std * jax.random.normal(subkey, shape=next_mean.shape)
+        next_action = jnp.tanh(next_z)
+
+        # Log-prob of the Gaussian before tanh
+        next_log_prob = -0.5 * (((next_z - next_mean) / (next_std + 1e-8)) ** 2
+                                 + 2 * jnp.log(next_std + 1e-8) + jnp.log(2 * jnp.pi))
+        next_log_prob = next_log_prob.sum(axis=-1)
+        next_log_prob -= jnp.log(1 - next_action**2 + 1e-6).sum(axis=-1)
+
+        # Rescale action for Q network input (use raw tanh action, not rescaled)
+        # The Q network takes the raw tanh action (in [-1, 1])
+        qf1_next_target = qf1.apply(qf1_target_params, next_hidden, next_action).squeeze(-1)
+        qf2_next_target = qf2.apply(qf2_target_params, next_hidden, next_action).squeeze(-1)
+        min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target) - alpha * next_log_prob
+        next_q_value = batch.reward + config["GAMMA"] * (1 - batch.done) * min_qf_next_target
+        next_q_value = jax.lax.stop_gradient(next_q_value)
+
+        # Current Q values
+        # The action in the buffer is already rescaled to [low, high], so we need to
+        # convert it back to [-1, 1] for the Q network
+        action_tanh = 2.0 * (batch.action - low) / (high - low) - 1.0
+        qf1_a_values = qf1.apply(qf1_state.params, hidden, action_tanh).squeeze(-1)
+        qf2_a_values = qf2.apply(qf2_state.params, hidden, action_tanh).squeeze(-1)
+
+        qf1_loss = ((qf1_a_values - next_q_value) ** 2).mean()
+        qf2_loss = ((qf2_a_values - next_q_value) ** 2).mean()
+        qf_loss = qf1_loss + qf2_loss
+
+        # Compute gradients for both Q networks separately
+        qf1_grads = jax.grad(lambda p: ((qf1.apply(p, hidden, action_tanh).squeeze(-1) - next_q_value) ** 2).mean())(qf1_state.params)
+        qf2_grads = jax.grad(lambda p: ((qf2.apply(p, hidden, action_tanh).squeeze(-1) - next_q_value) ** 2).mean())(qf2_state.params)
+        new_qf1_state = qf1_state.apply_gradients(grads=qf1_grads)
+        new_qf2_state = qf2_state.apply_gradients(grads=qf2_grads)
+
+        return (new_qf1_state, new_qf2_state, qf_loss, qf1_loss, qf2_loss,
+                qf1_a_values.mean(), qf2_a_values.mean(), next_q_value.mean(), key)
+
+    @jax.jit
+    def update_actor_and_alpha(
+        network_state, actor_state, qf1_state, qf2_state,
+        alpha_state, alpha, batch, key, global_step,
+    ):
+        """Update actor and alpha."""
+        hidden = network.apply(network_state.params, batch.obs)
+
+        def actor_loss_fn(actor_params):
+            mean, log_std = actor.apply(actor_params, hidden)
+            std = jnp.exp(log_std)
+            # Use a fresh key for the reparameterization trick
+            noise = jax.random.normal(key, shape=mean.shape)
+            z = mean + std * noise
+            action = jnp.tanh(z)
+            log_prob = -0.5 * (((z - mean) / (std + 1e-8)) ** 2
+                                + 2 * jnp.log(std + 1e-8) + jnp.log(2 * jnp.pi))
+            log_prob = log_prob.sum(axis=-1)
+            log_prob -= jnp.log(1 - action**2 + 1e-6).sum(axis=-1)
+
+            qf1_pi = qf1.apply(qf1_state.params, hidden, action).squeeze(-1)
+            qf2_pi = qf2.apply(qf2_state.params, hidden, action).squeeze(-1)
+            min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
+            actor_loss = (alpha * log_prob - min_qf_pi).mean()
+            return actor_loss, (log_prob,)
+
+        (actor_loss, (log_prob,)), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
+            actor_state.params
+        )
+        new_actor_state = actor_state.apply_gradients(grads=grads)
+
+        # Alpha update (if autotune)
+        if config["AUTOTUNE"]:
+            def alpha_loss_fn(p):
+                alpha_val = jnp.exp(p["log_alpha"])
+                a_loss = -(p["log_alpha"] * (log_prob + target_entropy)).mean()
+                return a_loss, alpha_val
+
+            (alpha_loss, new_alpha), a_grads = jax.value_and_grad(alpha_loss_fn, has_aux=True)(
+                alpha_state.params
+            )
+            new_alpha_state = alpha_state.apply_gradients(grads=a_grads)
+        else:
+            new_alpha_state = alpha_state
+            alpha_loss = jnp.array(0.0)
+            new_alpha = alpha
+
+        return (new_actor_state, new_alpha_state, new_alpha,
+                actor_loss, log_prob.mean(), alpha_loss, key)
+
+    # ---------- Save and eval function ----------
+    def save_and_eval(iteration, network_state, actor_state, qf1_state, qf2_state):
+        if config.get("SAVE_PATH") is not None:
+            model_path = f'{config["SAVE_PATH"]}/{run_name}/{config["EXP_NAME"]}_{iteration}_{time.time()}.cleanrl_model'
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            with open(model_path, "wb") as f:
+                f.write(
+                    flax.serialization.to_bytes(
+                        [
+                            config,
+                            [
+                                network_state.params,
+                                actor_state.params,
+                                qf1_state.params,
+                                qf2_state.params,
+                            ],
+                        ]
+                    )
+                )
+            print(f"model saved to {model_path}")
+        else:
+            model_path = None
+
+        # Evaluate across all mods
+        eval_mods = config["EVAL_MODS"] if len(config["EVAL_MODS"]) > 0 else config["TRAIN_MODS"]
+        eval_configs = [([], "default")]
+        if len(eval_mods) > 0:
+            mods_list = list(eval_mods)
+            for mod in mods_list:
+                mods_config = [mod] if not isinstance(mod, (list, tuple)) else list(mod)
+                mod_label = mod if isinstance(mod, str) else "_".join(str(m) for m in mods_config)
+                eval_configs.append((mods_config, mod_label))
+
+        metrics = {}
+        for mods_config, mod_label in eval_configs:
+            print(f"Evaluating on {mod_label} ...")
+            if model_path is None:
+                import tempfile
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".cleanrl_model") as tmp:
+                    tmp_path = tmp.name
+                    tmp.write(
+                        flax.serialization.to_bytes(
+                            [
+                                config,
+                                [
+                                    network_state.params,
+                                    actor_state.params,
+                                    qf1_state.params,
+                                    qf2_state.params,
+                                ],
+                            ]
+                        )
+                    )
+                eval_model_path = tmp_path
+            else:
+                eval_model_path = model_path
+
+            episodic_returns, env_states = evaluate(
+                eval_model_path,
+                partial(
+                    make_env,
+                    mods=mods_config,
+                    pixel_based=config["PIXEL_BASED"],
+                    native_downscaling=config["NATIVE_DOWNSCALING"],
+                    eval=True,
+                ),
+                config["ENV_ID"],
+                eval_episodes=10,
+                Model=(Network, Actor, SoftQNetwork) if config["PIXEL_BASED"] else (MLP_Network, Actor, SoftQNetwork),
+                seed=config["SEED"] + 42,
+            )
+            mean_return = np.mean(jax.device_get(episodic_returns))
+            metrics[mod_label] = mean_return
+            wandb.log({f"eval/episodic_return_{mod_label}": mean_return}, step=iteration)
+
+            if config.get("CAPTURE_VIDEO", False):
+                import jaxatari
+                clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_config).renderer
+                frames = jax.vmap(clean_renderer.render)(env_states)
+                frames = jnp.transpose(frames, (0, 3, 1, 2))
+                video = wandb.Video(np.array(frames), fps=30, format="mp4")
+                wandb.log({f"eval/video_{mod_label}": video}, step=iteration)
+                print(f"Video (eval) logged with {frames.shape[0]} frames.")
+
+            if model_path is None:
+                os.remove(eval_model_path)
+
+        return metrics
+
+    # ---------- Training loop ----------
+    num_envs = config["NUM_ENVS"]
+    total_timesteps = config["TOTAL_TIMESTEPS"]
+    learning_starts = config["LEARNING_STARTS"]
+
+    key, reset_key = jax.random.split(key)
+    obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
+
+    # Fill buffer with random actions (initial exploration)
+    print("Filling replay buffer with random actions...")
+    steps_to_fill = int(learning_starts // num_envs) + 1
+    for _ in range(steps_to_fill):
+        key, subkey = jax.random.split(key)
+        action = jax.random.uniform(subkey, (num_envs, action_dim), minval=low, maxval=high)
+        next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
+        transition = Transition(obs, action, reward, next_obs, next_done)
+        buffer_state = buffer.add(buffer_state, transition)
+        obs = next_obs
+
+    print("Starting training...")
+    global_step = 0
+    start_time = time.time()
+
+    # RTPT
+    total_iterations = total_timesteps // (num_envs * config["SCAN_STEPS"]) + 1
+    rtpt = RTPT(name_initials=config.get("NAME_INITIALS", "SA"), experiment_name=run_name, max_iterations=total_iterations)
+    rtpt.start()
+
+    steps_per_iteration = config["SCAN_STEPS"]
+    num_iterations = total_timesteps // (num_envs * steps_per_iteration) + 1
+
+    # Initialize target params
+    qf1_target_params = qf1_state.params
+    qf2_target_params = qf2_state.params
+
+    for iteration in range(num_iterations):
+        rtpt.step()
+
+        # Do SCAN_STEPS environment steps
+        for local_step in range(steps_per_iteration):
+            # Sample action
+            key, subkey = jax.random.split(key)
+            action, key = sample_action(network_state.params, actor_state.params, obs, subkey)
+
+            # Step environment
+            next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
+
+            # Add to buffer
+            transition = Transition(obs, action, reward, next_obs, next_done)
+            buffer_state = buffer.add(buffer_state, transition)
+
+            obs = next_obs
+            global_step += num_envs
+
+            # Update if buffer has enough samples
+            if buffer.can_sample(buffer_state):
+                key, sample_key = jax.random.split(key)
+                batch = buffer.sample(buffer_state, sample_key).experience
+                batch = Transition(*batch)
+
+                # Get current alpha
+                if config["AUTOTUNE"]:
+                    current_alpha = jnp.exp(alpha_state.params["log_alpha"])
+                else:
+                    current_alpha = config["ALPHA"]
+
+                # ---- Q update (every step after learning starts, like CleanRL) ----
+                (qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
+                 qf1_values, qf2_values, next_q_values, key) = update_qf(
+                    network_state, qf1_state, qf2_state,
+                    qf1_target_params, qf2_target_params,
+                    actor_state, current_alpha, batch, key,
+                )
+
+                # ---- Actor update (delayed: every POLICY_FREQUENCY steps) ----
+                def do_actor_update(carry):
+                    (network_state, actor_state, qf1_state, qf2_state,
+                     alpha_state, current_alpha, batch, key) = carry
+
+                    def scan_actor_update(carry, _):
+                        ns, acs, q1s, q2s, als, al, b, k = carry
+                        (new_acs, new_als, new_al,
+                         ac_loss, lp_mean, al_loss, k) = update_actor_and_alpha(
+                            ns, acs, q1s, q2s, als, al, b, k, global_step,
+                        )
+                        return (ns, new_acs, q1s, q2s, new_als, new_al, b, k), \
+                               (ac_loss, lp_mean, al_loss)
+
+                    (ns, new_actor_state, qf1_state, qf2_state,
+                     new_alpha_state, new_alpha, _, _), \
+                        (actor_losses, log_probs, alpha_losses) = jax.lax.scan(
+                        scan_actor_update,
+                        (network_state, actor_state, qf1_state, qf2_state,
+                         alpha_state, current_alpha, batch, key),
+                        None,
+                        length=config["POLICY_FREQUENCY"],
+                    )
+                    # Take the last values for logging
+                    return (new_actor_state, new_alpha_state, new_alpha,
+                            actor_losses[-1], log_probs[-1], alpha_losses[-1], key)
+
+                def no_actor_update(carry):
+                    (network_state, actor_state, qf1_state, qf2_state,
+                     alpha_state, current_alpha, batch, key) = carry
+                    return (actor_state, alpha_state, current_alpha,
+                            jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), key)
+
+                (actor_state, alpha_state, current_alpha,
+                 actor_loss, log_prob_mean, alpha_loss, key) = jax.lax.cond(
+                    global_step % config["POLICY_FREQUENCY"] == 0,
+                    do_actor_update,
+                    no_actor_update,
+                    (network_state, actor_state, qf1_state, qf2_state,
+                     alpha_state, current_alpha, batch, key),
+                )
+
+                # ---- Target network update (every TARGET_NETWORK_FREQUENCY steps) ----
+                def do_target_update(carry):
+                    qf1_state, qf2_state, qf1_target_params, qf2_target_params = carry
+                    new_qf1_target = optax.incremental_update(
+                        qf1_state.params, qf1_target_params, config["TAU"],
+                    )
+                    new_qf2_target = optax.incremental_update(
+                        qf2_state.params, qf2_target_params, config["TAU"],
+                    )
+                    return new_qf1_target, new_qf2_target
+
+                def no_target_update(carry):
+                    _, _, qf1_target_params, qf2_target_params = carry
+                    return qf1_target_params, qf2_target_params
+
+                qf1_target_params, qf2_target_params = jax.lax.cond(
+                    global_step % config["TARGET_NETWORK_FREQUENCY"] == 0,
+                    do_target_update,
+                    no_target_update,
+                    (qf1_state, qf2_state, qf1_target_params, qf2_target_params),
+                )
+
+        # Logging
+        if iteration % 1 == 0:
+            avg_return = info["returned_episode_returns"].mean() if "returned_episode_returns" in info else 0.0
+            avg_length = info["returned_episode_lengths"].mean() if "returned_episode_lengths" in info else 0.0
+
+            wandb.log({
+                "charts/avg_episodic_return": avg_return,
+                "charts/avg_episodic_length": avg_length,
+                "losses/qf1_loss": qf1_loss,
+                "losses/qf2_loss": qf2_loss,
+                "losses/qf_loss": qf_loss / 2.0,
+                "losses/qf1_values": qf1_values,
+                "losses/qf2_values": qf2_values,
+                "losses/actor_loss": actor_loss,
+                "losses/log_prob_mean": log_prob_mean,
+                "losses/alpha_loss": alpha_loss,
+                "losses/alpha": current_alpha,
+                "charts/SPS": int(global_step / (time.time() - start_time + 1e-8)),
+                "charts/global_step": global_step,
+                "charts/iteration": iteration,
+            }, step=global_step)
+
+        # Evaluation
+        if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:
+            save_and_eval(iteration, network_state, actor_state, qf1_state, qf2_state)
+
+    # Final eval
+    print("Evaluating final model ...")
+    save_and_eval(iteration + 1, network_state, actor_state, qf1_state, qf2_state)
+    wandb.finish()
+    print("Training finished.")
