@@ -1,9 +1,14 @@
 # Adapted from https://github.com/vwxyzjn/cleanrl/blob/master/cleanrl/sac_continuous_action.py
 import os
+
+# Limit JAX GPU memory usage to avoid OOM / fragmentation issues.
+# Must be set before JAX initializes its allocator.
+os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
+
 import random
 import time
 from functools import partial
-from typing import NamedTuple, Optional
+from typing import Optional
 
 import flashbax as fbx
 import flax
@@ -94,8 +99,17 @@ class Network(nn.Module):
     """CNN for pixel observations."""
     @nn.compact
     def __call__(self, x):
-        x = jnp.transpose(x, (0, 2, 3, 1))
-        x = x / (255.0)
+        if x.ndim == 6:
+            # (batch, env, stack, H, W, C)
+            b, n_env, stack, h, w, c = x.shape
+            x = x.reshape((b * n_env, h, w, stack * c))
+
+        elif x.ndim == 5:
+            # (batch, stack, H, W, C)
+            b, stack, h, w, c = x.shape
+            x = x.reshape((b, h, w, stack * c))
+
+        x = x.astype(jnp.float32) / 255.0
         x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
                     kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
@@ -157,16 +171,6 @@ class SoftQNetwork(nn.Module):
         return nn.Dense(1, kernel_init=orthogonal(1.0))(x)
 
 
-# ---------- All parameters in one NamedTuple ----------
-class AgentParams(NamedTuple):
-    network_params: flax.core.FrozenDict
-    actor_params: flax.core.FrozenDict
-    qf1_params: flax.core.FrozenDict
-    qf2_params: flax.core.FrozenDict
-    qf1_target_params: flax.core.FrozenDict
-    qf2_target_params: flax.core.FrozenDict
-
-
 @flax.struct.dataclass
 class Transition:
     obs: jnp.ndarray
@@ -221,13 +225,13 @@ def single_run(config: dict):
     @jax.jit
     def vmap_reset(key):
         obs, state = jax.vmap(env.reset)(key)
-        return obs.squeeze(), state
+        return obs, state
 
     @jax.jit
     def vmap_step(state, action):
         next_obs, state, reward, terminated, truncated, info = jax.vmap(env.step)(state, action)
         next_done = jnp.logical_or(terminated, truncated)
-        return next_obs.squeeze(), state, reward, next_done, info
+        return next_obs, state, reward, next_done, info
 
     # Networks
     NetworkClass = Network if config["PIXEL_BASED"] else MLP_Network
@@ -236,7 +240,10 @@ def single_run(config: dict):
     qf1 = SoftQNetwork(action_dim=action_dim)
     qf2 = SoftQNetwork(action_dim=action_dim)
 
-    sample_obs = obs_space.sample(jax.random.PRNGKey(0)).squeeze()[None, ...]
+    sample_obs = jnp.zeros(
+        (1,) + obs_space.shape,
+        dtype=jnp.uint8
+    )
     network_params = network.init(network_key, sample_obs)
     hidden = network.apply(network_params, sample_obs)
     actor_params = actor.init(actor_key, hidden)
@@ -269,24 +276,14 @@ def single_run(config: dict):
     actor_state = TrainState.create(apply_fn=None, params=actor_params, tx=policy_tx)
     network_state = TrainState.create(apply_fn=None, params=network_params, tx=policy_tx)
 
-    # Replay buffer with flashbax
-    buffer = fbx.make_item_buffer(
-        max_length=config["BUFFER_SIZE"],
-        min_length=config["BATCH_SIZE"],
-        sample_batch_size=config["BATCH_SIZE"],
-        add_batches=True,
-        add_sequences=False,
-    )
-    buffer_state = buffer.init(jax.random.PRNGKey(0))
-
     # Automatic entropy tuning
     if config["AUTOTUNE"]:
         target_entropy = -action_dim
-        log_alpha = jnp.zeros(1)
+        log_alpha = jnp.zeros(())
         alpha_state = TrainState.create(
             apply_fn=None,
             params={"log_alpha": log_alpha},
-            tx=optax.adam(learning_rate=config["Q_LR"], eps=1e-5),  # CleanRL uses q_lr for alpha
+            tx=optax.adam(learning_rate=config.get("ALPHA_LR", config["POLICY_LR"]), eps=1e-5),
         )
     else:
         alpha = config["ALPHA"]
@@ -317,15 +314,24 @@ def single_run(config: dict):
 
     # ---------- SAC update functions ----------
 
+    def remove_env_dim(x):
+        # Flashbax adds an env dimension when add_batches=True:
+        # (batch, num_envs, ...). Handle both NUM_ENVS=1 and NUM_ENVS>1.
+        if x.ndim >= 2 and x.shape[1] > 1:
+            return x.reshape((-1,) + x.shape[2:])
+        if x.ndim >= 2 and x.shape[1] == 1:
+            return x.squeeze(1)
+        return x
+
     @jax.jit
     def update_qf(
         network_state, qf1_state, qf2_state,
         qf1_target_params, qf2_target_params,
         actor_state, alpha, batch, key,
     ):
-        """Update Q-networks using MSE loss against target Q values."""
-        hidden = network.apply(network_state.params, batch.obs)
-        next_hidden = network.apply(network_state.params, batch.next_obs)
+        """Update Q-networks and shared encoder using MSE loss against target Q values."""
+        # next_hidden is stop-gradient (used for target computation only)
+        next_hidden = jax.lax.stop_gradient(network.apply(network_state.params, batch.next_obs))
 
         # Compute target Q (with torch.no_grad() equivalent)
         next_mean, next_log_std = actor.apply(actor_state.params, next_hidden)
@@ -340,7 +346,6 @@ def single_run(config: dict):
         next_log_prob = next_log_prob.sum(axis=-1)
         next_log_prob -= jnp.log(1 - next_action**2 + 1e-6).sum(axis=-1)
 
-        # Rescale action for Q network input (use raw tanh action, not rescaled)
         # The Q network takes the raw tanh action (in [-1, 1])
         qf1_next_target = qf1.apply(qf1_target_params, next_hidden, next_action).squeeze(-1)
         qf2_next_target = qf2.apply(qf2_target_params, next_hidden, next_action).squeeze(-1)
@@ -350,37 +355,59 @@ def single_run(config: dict):
 
         # Current Q values
         # The action in the buffer is already rescaled to [low, high], so we need to
-        # convert it back to [-1, 1] for the Q network
-        action_tanh = 2.0 * (batch.action - low) / (high - low) - 1.0
-        qf1_a_values = qf1.apply(qf1_state.params, hidden, action_tanh).squeeze(-1)
-        qf2_a_values = qf2.apply(qf2_state.params, hidden, action_tanh).squeeze(-1)
+        # convert it back to [-1, 1] for the Q network.
+        # Guard against degenerate action spaces (high == low) and clip to avoid
+        # NaN from float32 rounding pushing the value slightly outside [-1, 1].
+        action_range = jnp.where(high > low, high - low, 1.0)
+        action_tanh = jnp.clip(
+            2.0 * (batch.action - low) / action_range - 1.0,
+            -0.999999,
+            0.999999,
+        )
 
-        qf1_loss = ((qf1_a_values - next_q_value) ** 2).mean()
-        qf2_loss = ((qf2_a_values - next_q_value) ** 2).mean()
-        qf_loss = qf1_loss + qf2_loss
+        # Compute loss and gradients for encoder + both Q-networks in a single pass.
+        # Gradient flows through the encoder from both Q-losses (like CleanRL where
+        # each Q-network updates its own encoder; here the encoder is shared).
+        def qf_loss_fn(params):
+            network_params, qf1_params, qf2_params = params
+            hidden = network.apply(network_params, batch.obs)
+            qf1_a = qf1.apply(qf1_params, hidden, action_tanh).squeeze(-1)
+            qf2_a = qf2.apply(qf2_params, hidden, action_tanh).squeeze(-1)
+            qf1_loss = ((qf1_a - next_q_value) ** 2).mean()
+            qf2_loss = ((qf2_a - next_q_value) ** 2).mean()
+            return qf1_loss + qf2_loss, (qf1_loss, qf2_loss, qf1_a.mean(), qf2_a.mean())
 
-        # Compute gradients for both Q networks separately
-        qf1_grads = jax.grad(lambda p: ((qf1.apply(p, hidden, action_tanh).squeeze(-1) - next_q_value) ** 2).mean())(qf1_state.params)
-        qf2_grads = jax.grad(lambda p: ((qf2.apply(p, hidden, action_tanh).squeeze(-1) - next_q_value) ** 2).mean())(qf2_state.params)
+        (qf_loss, (qf1_loss, qf2_loss, qf1_values, qf2_values)), \
+            (network_grads, qf1_grads, qf2_grads) = jax.value_and_grad(qf_loss_fn, has_aux=True)(
+                (network_state.params, qf1_state.params, qf2_state.params)
+            )
+
+        new_network_state = network_state.apply_gradients(grads=network_grads)
         new_qf1_state = qf1_state.apply_gradients(grads=qf1_grads)
         new_qf2_state = qf2_state.apply_gradients(grads=qf2_grads)
 
-        return (new_qf1_state, new_qf2_state, qf_loss, qf1_loss, qf2_loss,
-                qf1_a_values.mean(), qf2_a_values.mean(), next_q_value.mean(), key)
+        return (new_qf1_state, new_qf2_state, new_network_state, qf_loss, qf1_loss, qf2_loss,
+                qf1_values, qf2_values, next_q_value.mean(), key)
 
     @jax.jit
     def update_actor_and_alpha(
-        network_state, actor_state, qf1_state, qf2_state,
-        alpha_state, alpha, batch, key, global_step,
+        network_params, actor_state, qf1_state, qf2_state,
+        alpha_state, alpha, batch, key,
     ):
-        """Update actor and alpha."""
-        hidden = network.apply(network_state.params, batch.obs)
+        """Update actor and alpha. The encoder is FROZEN (stop-gradient) here,
+        so it is only trained by the Q-loss in update_qf (standard practice for
+        shared-encoder SAC variants such as DrQ / SAC-AE)."""
+        # Freeze encoder representation for the policy update to avoid
+        # representation drift from two competing gradient sources.
+        hidden = jax.lax.stop_gradient(network.apply(network_params, batch.obs))
+        # Split the key so each actor update inside the delayed-policy loop
+        # uses fresh noise (previously the same key was reused across iterations).
+        key, noise_key = jax.random.split(key)
 
         def actor_loss_fn(actor_params):
             mean, log_std = actor.apply(actor_params, hidden)
             std = jnp.exp(log_std)
-            # Use a fresh key for the reparameterization trick
-            noise = jax.random.normal(key, shape=mean.shape)
+            noise = jax.random.normal(noise_key, shape=mean.shape)
             z = mean + std * noise
             action = jnp.tanh(z)
             log_prob = -0.5 * (((z - mean) / (std + 1e-8)) ** 2
@@ -392,12 +419,12 @@ def single_run(config: dict):
             qf2_pi = qf2.apply(qf2_state.params, hidden, action).squeeze(-1)
             min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
             actor_loss = (alpha * log_prob - min_qf_pi).mean()
-            return actor_loss, (log_prob,)
+            return actor_loss, log_prob
 
-        (actor_loss, (log_prob,)), grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
+        (actor_loss, log_prob), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
             actor_state.params
         )
-        new_actor_state = actor_state.apply_gradients(grads=grads)
+        new_actor_state = actor_state.apply_gradients(grads=actor_grads)
 
         # Alpha update (if autotune)
         if config["AUTOTUNE"]:
@@ -515,6 +542,45 @@ def single_run(config: dict):
     key, reset_key = jax.random.split(key)
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
 
+    # Replay buffer with flashbax
+    dummy_transition = Transition(
+        obs=obs,
+        action=jnp.zeros((config["NUM_ENVS"], action_dim), dtype=jnp.float32),
+        reward=jnp.zeros((config["NUM_ENVS"],), dtype=jnp.float32),
+        next_obs=obs,
+        done=jnp.zeros((config["NUM_ENVS"],), dtype=jnp.bool_),
+    )
+    buffer = fbx.make_item_buffer(
+        max_length=config["BUFFER_SIZE"],
+        min_length=config["BATCH_SIZE"],
+        sample_batch_size=config["BATCH_SIZE"],
+        add_batches=True,
+        add_sequences=False,
+    )
+    buffer_state = buffer.init(dummy_transition)
+
+    # Keep the replay buffer on CPU by default to avoid exhausting GPU VRAM.
+    buffer_on_cpu = config.get("BUFFER_ON_CPU", True)
+    if buffer_on_cpu:
+        cpu_device = jax.devices("cpu")[0]
+        buffer_state = jax.device_put(buffer_state, cpu_device)
+
+        @jax.jit(device=cpu_device)
+        def buffer_add(state, transition):
+            return buffer.add(state, transition)
+
+        @jax.jit(device=cpu_device)
+        def buffer_sample(state, key):
+            return buffer.sample(state, key)
+
+        @jax.jit(device=cpu_device)
+        def buffer_can_sample(state):
+            return buffer.can_sample(state)
+    else:
+        buffer_add = buffer.add
+        buffer_sample = buffer.sample
+        buffer_can_sample = buffer.can_sample
+
     # Fill buffer with random actions (initial exploration)
     print("Filling replay buffer with random actions...")
     steps_to_fill = int(learning_starts // num_envs) + 1
@@ -522,8 +588,14 @@ def single_run(config: dict):
         key, subkey = jax.random.split(key)
         action = jax.random.uniform(subkey, (num_envs, action_dim), minval=low, maxval=high)
         next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
-        transition = Transition(obs, action, reward, next_obs, next_done)
-        buffer_state = buffer.add(buffer_state, transition)
+        transition = Transition(
+            obs,
+            action,
+            reward.astype(jnp.float32),
+            next_obs,
+            next_done.astype(jnp.bool_)
+        )
+        buffer_state = buffer_add(buffer_state, transition)
         obs = next_obs
 
     print("Starting training...")
@@ -538,10 +610,6 @@ def single_run(config: dict):
     steps_per_iteration = config["SCAN_STEPS"]
     num_iterations = total_timesteps // (num_envs * steps_per_iteration) + 1
 
-    # Initialize target params
-    qf1_target_params = qf1_state.params
-    qf2_target_params = qf2_state.params
-
     for iteration in range(num_iterations):
         rtpt.step()
 
@@ -555,18 +623,29 @@ def single_run(config: dict):
             next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
 
             # Add to buffer
-            transition = Transition(obs, action, reward, next_obs, next_done)
-            buffer_state = buffer.add(buffer_state, transition)
+            transition = Transition(
+                obs.astype(jnp.uint8),
+                action.astype(jnp.float32),
+                reward.astype(jnp.float32),
+                next_obs.astype(jnp.uint8),
+                next_done.astype(jnp.bool_)
+            )
+            buffer_state = buffer_add(buffer_state, transition)
 
             obs = next_obs
             global_step += num_envs
 
             # Update if buffer has enough samples
-            if buffer.can_sample(buffer_state):
+            if buffer_can_sample(buffer_state):
                 key, sample_key = jax.random.split(key)
-                batch = buffer.sample(buffer_state, sample_key).experience
-                batch = Transition(*batch)
-
+                batch = buffer_sample(buffer_state, sample_key).experience
+                batch = Transition(
+                    remove_env_dim(batch.obs).astype(jnp.float32),
+                    remove_env_dim(batch.action).astype(jnp.float32),
+                    remove_env_dim(batch.reward).astype(jnp.float32),
+                    remove_env_dim(batch.next_obs).astype(jnp.float32),
+                    remove_env_dim(batch.done).astype(jnp.float32),
+                )
                 # Get current alpha
                 if config["AUTOTUNE"]:
                     current_alpha = jnp.exp(alpha_state.params["log_alpha"])
@@ -574,83 +653,64 @@ def single_run(config: dict):
                     current_alpha = config["ALPHA"]
 
                 # ---- Q update (every step after learning starts, like CleanRL) ----
-                (qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
+                # Encoder is also updated here (gradient from Q-loss).
+                (qf1_state, qf2_state, network_state, qf_loss, qf1_loss, qf2_loss,
                  qf1_values, qf2_values, next_q_values, key) = update_qf(
                     network_state, qf1_state, qf2_state,
                     qf1_target_params, qf2_target_params,
                     actor_state, current_alpha, batch, key,
                 )
 
-                # ---- Actor update (delayed: every POLICY_FREQUENCY steps) ----
-                def do_actor_update(carry):
-                    (network_state, actor_state, qf1_state, qf2_state,
-                     alpha_state, current_alpha, batch, key) = carry
-
-                    def scan_actor_update(carry, _):
-                        ns, acs, q1s, q2s, als, al, b, k = carry
-                        (new_acs, new_als, new_al,
-                         ac_loss, lp_mean, al_loss, k) = update_actor_and_alpha(
-                            ns, acs, q1s, q2s, als, al, b, k, global_step,
+                # ---- Actor + Alpha update (delayed: every POLICY_FREQUENCY steps) ----
+                # The loop matches CleanRL exactly: update the actor POLICY_FREQUENCY
+                # times on the same batch to compensate for the delayed update.
+                # The encoder is NOT updated here (see update_actor_and_alpha).
+                if global_step % config["POLICY_FREQUENCY"] == 0:
+                    for _ in range(config["POLICY_FREQUENCY"]):
+                        (
+                            actor_state,
+                            alpha_state,
+                            current_alpha,
+                            actor_loss,
+                            log_prob_mean,
+                            alpha_loss,
+                            key,
+                        ) = update_actor_and_alpha(
+                            network_state.params,
+                            actor_state,
+                            qf1_state,
+                            qf2_state,
+                            alpha_state,
+                            current_alpha,
+                            batch,
+                            key,
                         )
-                        return (ns, new_acs, q1s, q2s, new_als, new_al, b, k), \
-                               (ac_loss, lp_mean, al_loss)
-
-                    (ns, new_actor_state, qf1_state, qf2_state,
-                     new_alpha_state, new_alpha, _, _), \
-                        (actor_losses, log_probs, alpha_losses) = jax.lax.scan(
-                        scan_actor_update,
-                        (network_state, actor_state, qf1_state, qf2_state,
-                         alpha_state, current_alpha, batch, key),
-                        None,
-                        length=config["POLICY_FREQUENCY"],
-                    )
-                    # Take the last values for logging
-                    return (new_actor_state, new_alpha_state, new_alpha,
-                            actor_losses[-1], log_probs[-1], alpha_losses[-1], key)
-
-                def no_actor_update(carry):
-                    (network_state, actor_state, qf1_state, qf2_state,
-                     alpha_state, current_alpha, batch, key) = carry
-                    return (actor_state, alpha_state, current_alpha,
-                            jnp.array(0.0), jnp.array(0.0), jnp.array(0.0), key)
-
-                (actor_state, alpha_state, current_alpha,
-                 actor_loss, log_prob_mean, alpha_loss, key) = jax.lax.cond(
-                    global_step % config["POLICY_FREQUENCY"] == 0,
-                    do_actor_update,
-                    no_actor_update,
-                    (network_state, actor_state, qf1_state, qf2_state,
-                     alpha_state, current_alpha, batch, key),
-                )
+                else:
+                    actor_loss = jnp.array(0.0)
+                    log_prob_mean = jnp.array(0.0)
+                    alpha_loss = jnp.array(0.0)
 
                 # ---- Target network update (every TARGET_NETWORK_FREQUENCY steps) ----
-                def do_target_update(carry):
-                    qf1_state, qf2_state, qf1_target_params, qf2_target_params = carry
-                    new_qf1_target = optax.incremental_update(
-                        qf1_state.params, qf1_target_params, config["TAU"],
+                if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
+                    qf1_target_params = optax.incremental_update(
+                        qf1_state.params,
+                        qf1_target_params,
+                        config["TAU"],
                     )
-                    new_qf2_target = optax.incremental_update(
-                        qf2_state.params, qf2_target_params, config["TAU"],
+                    qf2_target_params = optax.incremental_update(
+                        qf2_state.params,
+                        qf2_target_params,
+                        config["TAU"],
                     )
-                    return new_qf1_target, new_qf2_target
-
-                def no_target_update(carry):
-                    _, _, qf1_target_params, qf2_target_params = carry
-                    return qf1_target_params, qf2_target_params
-
-                qf1_target_params, qf2_target_params = jax.lax.cond(
-                    global_step % config["TARGET_NETWORK_FREQUENCY"] == 0,
-                    do_target_update,
-                    no_target_update,
-                    (qf1_state, qf2_state, qf1_target_params, qf2_target_params),
-                )
 
         # Logging
         if iteration % 1 == 0:
             avg_return = info["returned_episode_returns"].mean() if "returned_episode_returns" in info else 0.0
             avg_length = info["returned_episode_lengths"].mean() if "returned_episode_lengths" in info else 0.0
 
-            wandb.log({
+            # Gather all device tensors in a single host transfer to avoid
+            # repeated device->host copies (each float() triggers one).
+            metrics = jax.device_get({
                 "charts/avg_episodic_return": avg_return,
                 "charts/avg_episodic_length": avg_length,
                 "losses/qf1_loss": qf1_loss,
@@ -662,10 +722,12 @@ def single_run(config: dict):
                 "losses/log_prob_mean": log_prob_mean,
                 "losses/alpha_loss": alpha_loss,
                 "losses/alpha": current_alpha,
-                "charts/SPS": int(global_step / (time.time() - start_time + 1e-8)),
+                "reward": jnp.mean(batch.reward),
+                "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
-            }, step=global_step)
+            })
+            wandb.log(metrics, step=global_step)
 
         # Evaluation
         if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:
@@ -673,6 +735,8 @@ def single_run(config: dict):
 
     # Final eval
     print("Evaluating final model ...")
-    save_and_eval(iteration + 1, network_state, actor_state, qf1_state, qf2_state)
+    metrics = save_and_eval(iteration + 1, network_state, actor_state, qf1_state, qf2_state)
     wandb.finish()
     print("Training finished.")
+
+    return metrics

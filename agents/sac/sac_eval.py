@@ -35,20 +35,36 @@ def evaluate(
     @jax.jit
     def wrapped_reset(key):
         next_obs, state = env.reset(key)
-        return next_obs.squeeze()[None, ...], state
+        if next_obs.ndim == 3:
+            next_obs = next_obs[None, ..., None]
+        else:
+            next_obs = next_obs[None, ...]
+
+        return next_obs, state
 
     @jax.jit
     def wrapped_step(state, action):
         next_obs, next_state, reward, terminated, truncated, info = env.step(state, action.squeeze())
         done = jnp.logical_or(terminated, truncated)
-        return next_obs.squeeze()[None, ...], next_state, reward, done, info
+        if next_obs.ndim == 3:
+            next_obs = next_obs[None, ..., None]
+        else:
+            next_obs = next_obs[None, ...]
+
+        return next_obs, next_state, reward, done, info
 
     key, reset_key = jax.random.split(key)
     network = _Network()
     actor = _Actor(action_dim=env.action_space().shape[0])
     qf = _SoftQNetwork(action_dim=env.action_space().shape[0])
     key, network_key, actor_key, qf_key = jax.random.split(key, 4)
-    sample_obs = env.observation_space().sample(jax.random.PRNGKey(0)).squeeze()[None, ...]
+    sample_obs = env.observation_space().sample(jax.random.PRNGKey(0))
+    if sample_obs.ndim == 3:
+        sample_obs = sample_obs[None, ..., None]
+    else:
+        sample_obs = sample_obs[None, ...]
+
+    sample_obs = sample_obs.astype(jnp.float32)
     network_params = network.init(network_key, sample_obs)
     hidden = network.apply(network_params, sample_obs)
     actor_params = actor.init(actor_key, hidden)
@@ -67,7 +83,11 @@ def evaluate(
     @jax.jit
     def get_action(network_params, actor_params, next_obs, key):
         """Deterministic action (mean, no noise) for evaluation."""
+        if next_obs.ndim == 4:
+            next_obs = next_obs[None, ...]
+
         hidden = network.apply(network_params, next_obs)
+        hidden = hidden.squeeze(0)
         mean, _ = actor.apply(actor_params, hidden)
         action_tanh = jnp.tanh(mean)
         action = low + (action_tanh + 1.0) * (high - low) / 2.0

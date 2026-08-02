@@ -18,5 +18,10 @@ AUTOTUNE: True
 
 POLICY_LR: 0.0003
 Q_LR: 0.001
+ALPHA_LR: 0.0003
 POLICY_FREQUENCY: 2
 TARGET_NETWORK_FREQUENCY: 1
+
+# Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
+# Set to False to keep it on GPU (faster but uses much more VRAM).
+BUFFER_ON_CPU: True
