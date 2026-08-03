@@ -609,13 +609,43 @@ def single_run(config: dict):
         buffer_sample = buffer.sample
         buffer_can_sample = buffer.can_sample
 
-    # Fill buffer with random actions (initial exploration)
+    # Fill buffer with random actions (initial exploration).
+    # Batch multiple transitions on GPU, then move the whole batch to CPU and
+    # call buffer.add once per batch. This avoids a synchronous GPU->CPU device
+    # transfer + full-buffer scatter-add for every single transition (which was
+    # the dominant cost: ~102ms/step vs ~2.7ms for the env step).
     print("Filling replay buffer with random actions...")
     steps_to_fill = int(learning_starts // num_envs) + 1
+    fill_batch_size = config.get("FILL_BATCH_SIZE", 256)
     fill_t_step = 0.0
     fill_t_transition = 0.0
     fill_t_add = 0.0
+    n_flushes = 0
     fill_start = time.perf_counter()
+
+    pending = []  # transitions kept on GPU until we flush a batch
+
+    def flush_pending(pending, buffer_state):
+        nonlocal n_flushes, fill_t_add
+        if not pending:
+            return buffer_state
+        # Stack (N, num_envs, ...) — matches flashbax item_buffer.add(add_batches=True).
+        batch = Transition(
+            obs=jnp.stack([t.obs for t in pending], axis=0),
+            action=jnp.stack([t.action for t in pending], axis=0),
+            reward=jnp.stack([t.reward for t in pending], axis=0),
+            next_obs=jnp.stack([t.next_obs for t in pending], axis=0),
+            done=jnp.stack([t.done for t in pending], axis=0),
+        )
+        # Move the whole batch to CPU in a single transfer.
+        batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
+        t2 = time.perf_counter()
+        new_state = buffer_add(buffer_state, batch)
+        t3 = time.perf_counter()
+        fill_t_add += t3 - t2
+        n_flushes += 1
+        return new_state
+
     for _ in range(steps_to_fill):
         key, subkey = jax.random.split(key)
         action = jax.random.uniform(subkey, (num_envs, action_dim), minval=low, maxval=high)
@@ -630,15 +660,22 @@ def single_run(config: dict):
             next_done.astype(jnp.bool_)
         )
         t2 = time.perf_counter()
-        buffer_state = buffer_add(buffer_state, transition)
-        t3 = time.perf_counter()
-        obs = next_obs
         fill_t_step += t1 - t0
         fill_t_transition += t2 - t1
-        fill_t_add += t3 - t2
+        pending.append(transition)
+        if len(pending) >= fill_batch_size:
+            buffer_state = flush_pending(pending, buffer_state)
+            pending = []
+        obs = next_obs
+
+    # Flush any remaining transitions.
+    buffer_state = flush_pending(pending, buffer_state)
+
     fill_elapsed = time.perf_counter() - fill_start
     print(f"[FILL] steps={steps_to_fill} elapsed={fill_elapsed:.2f}s "
-          f"step={fill_t_step:.2f}s transition={fill_t_transition:.2f}s add={fill_t_add:.2f}s")
+          f"step={fill_t_step:.2f}s transition={fill_t_transition:.2f}s "
+          f"add={fill_t_add:.2f}s flushes={n_flushes} "
+          f"avg_add={fill_t_add / max(n_flushes, 1) * 1000:.3f}ms")
     used_mb, total_mb, util = get_gpu_stats()
     print(f"[FILL] GPU mem={used_mb}/{total_mb}MB util={util}%")
 

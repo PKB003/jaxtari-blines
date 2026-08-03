@@ -25,3 +25,9 @@ TARGET_NETWORK_FREQUENCY: 1
 # Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
 # Set to False to keep it on GPU (faster but uses much more VRAM).
 BUFFER_ON_CPU: True
+
+# Number of transitions to accumulate on GPU before transferring the whole
+# batch to CPU and calling buffer.add once. Batching avoids a synchronous
+# GPU->CPU device transfer + full-buffer scatter-add per transition during
+# the initial replay-buffer warmup (which was the dominant fill cost).
+FILL_BATCH_SIZE: 256
