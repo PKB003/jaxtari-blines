@@ -804,6 +804,7 @@ def single_run(config: dict):
                 t7 = time.perf_counter()
                 train_t_update_qf += t7 - t6
                 train_n_update_qf += 1
+                t8 = t7  # default: if actor update does not run, target update is measured from end of Q update
 
                 # 8. Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
                 # The loop matches CleanRL exactly: update the actor POLICY_FREQUENCY
