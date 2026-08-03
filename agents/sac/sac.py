@@ -6,6 +6,7 @@ import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 
 import random
+import subprocess
 import time
 from functools import partial
 from typing import Optional
@@ -33,6 +34,26 @@ from jaxatari import spaces
 
 from rtpt import RTPT
 from agents.sac.sac_eval import evaluate
+
+
+def get_gpu_stats():
+    """Return (memory_used_MB, memory_total_MB, utilization_percent) for the first GPU."""
+    try:
+        out = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        line = out.stdout.strip().splitlines()[0]
+        used, total, util = [int(x) for x in line.split(",")]
+        return used, total, util
+    except Exception as e:
+        return -1, -1, -1
 
 
 def make_env(
@@ -591,10 +612,16 @@ def single_run(config: dict):
     # Fill buffer with random actions (initial exploration)
     print("Filling replay buffer with random actions...")
     steps_to_fill = int(learning_starts // num_envs) + 1
+    fill_t_step = 0.0
+    fill_t_transition = 0.0
+    fill_t_add = 0.0
+    fill_start = time.perf_counter()
     for _ in range(steps_to_fill):
         key, subkey = jax.random.split(key)
         action = jax.random.uniform(subkey, (num_envs, action_dim), minval=low, maxval=high)
+        t0 = time.perf_counter()
         next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
+        t1 = time.perf_counter()
         transition = Transition(
             obs,
             action,
@@ -602,12 +629,26 @@ def single_run(config: dict):
             next_obs,
             next_done.astype(jnp.bool_)
         )
+        t2 = time.perf_counter()
         buffer_state = buffer_add(buffer_state, transition)
+        t3 = time.perf_counter()
         obs = next_obs
+        fill_t_step += t1 - t0
+        fill_t_transition += t2 - t1
+        fill_t_add += t3 - t2
+    fill_elapsed = time.perf_counter() - fill_start
+    print(f"[FILL] steps={steps_to_fill} elapsed={fill_elapsed:.2f}s "
+          f"step={fill_t_step:.2f}s transition={fill_t_transition:.2f}s add={fill_t_add:.2f}s")
+    used_mb, total_mb, util = get_gpu_stats()
+    print(f"[FILL] GPU mem={used_mb}/{total_mb}MB util={util}%")
 
     print("Starting training...")
     global_step = 0
     start_time = time.time()
+    train_t_add = 0.0
+    train_t_sample = 0.0
+    train_n_add = 0
+    train_n_sample = 0
 
     # RTPT
     total_iterations = total_timesteps // (num_envs * config["SCAN_STEPS"]) + 1
@@ -637,7 +678,11 @@ def single_run(config: dict):
                 next_obs.astype(jnp.uint8),
                 next_done.astype(jnp.bool_)
             )
+            t_add0 = time.perf_counter()
             buffer_state = buffer_add(buffer_state, transition)
+            t_add1 = time.perf_counter()
+            train_t_add += t_add1 - t_add0
+            train_n_add += 1
 
             obs = next_obs
             global_step += num_envs
@@ -646,7 +691,11 @@ def single_run(config: dict):
             if buffer_can_sample(buffer_state):
                 key, sample_key = jax.random.split(key)
                 # Sample on CPU (replay buffer lives on CPU to save VRAM).
+                t_samp0 = time.perf_counter()
                 batch = buffer_sample(buffer_state, sample_key).experience
+                t_samp1 = time.perf_counter()
+                train_t_sample += t_samp1 - t_samp0
+                train_n_sample += 1
                 # Remove env dims on CPU first (reduces transfer size).
                 batch = Transition(
                     remove_env_dim(batch.obs),
@@ -759,5 +808,11 @@ def single_run(config: dict):
     metrics = save_and_eval(iteration + 1, network_state, actor_state, qf1_state, qf2_state)
     wandb.finish()
     print("Training finished.")
+    train_elapsed = time.time() - start_time
+    print(f"[TRAIN] elapsed={train_elapsed:.2f}s SPS={global_step / (train_elapsed + 1e-8):.1f}")
+    print(f"[TRAIN] buffer_add: n={train_n_add} total={train_t_add:.2f}s avg={train_t_add / max(train_n_add, 1) * 1000:.3f}ms")
+    print(f"[TRAIN] buffer_sample: n={train_n_sample} total={train_t_sample:.2f}s avg={train_t_sample / max(train_n_sample, 1) * 1000:.3f}ms")
+    used_mb, total_mb, util = get_gpu_stats()
+    print(f"[TRAIN] GPU mem={used_mb}/{total_mb}MB util={util}%")
 
     return metrics
