@@ -31,3 +31,10 @@ BUFFER_ON_CPU: True
 # GPU->CPU device transfer + full-buffer scatter-add per transition during
 # the initial replay-buffer warmup (which was the dominant fill cost).
 FILL_BATCH_SIZE: 256
+
+# Same batching for the training loop's buffer.add calls. Profiling with
+# block_until_ready showed per-transition buffer_add costs ~94ms (GPU->CPU
+# transfer + full-buffer CPU scatter-add) and dominated training time (~83%).
+# Accumulating a few transitions on GPU and flushing them together reduces
+# the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
+TRAIN_ADD_BATCH_SIZE: 8

@@ -702,6 +702,35 @@ def single_run(config: dict):
     train_t_update_actor = 0.0;   train_n_update_actor = 0
     train_t_target_update = 0.0;  train_n_target_update = 0
 
+    # Batched training buffer adds: accumulate transitions on GPU, then flush the
+    # whole batch to CPU with a single buffer.add. Profiling showed per-transition
+    # buffer_add costs ~94ms (GPU->CPU transfer + full-buffer CPU scatter-add) and
+    # dominated training time (~83%). Batching mirrors the fill-loop fix.
+    train_add_batch_size = config.get("TRAIN_ADD_BATCH_SIZE", 8)
+    train_pending = []
+
+    def flush_train_pending(pending, buffer_state):
+        nonlocal train_t_buffer_add, train_n_buffer_add
+        if not pending:
+            return buffer_state
+        # Stack (N, num_envs, ...) — matches flashbax item_buffer.add(add_batches=True).
+        batch = Transition(
+            obs=jnp.stack([t.obs for t in pending], axis=0),
+            action=jnp.stack([t.action for t in pending], axis=0),
+            reward=jnp.stack([t.reward for t in pending], axis=0),
+            next_obs=jnp.stack([t.next_obs for t in pending], axis=0),
+            done=jnp.stack([t.done for t in pending], axis=0),
+        )
+        # Move the whole batch to CPU in a single transfer.
+        batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
+        t4a = time.perf_counter()
+        new_state = buffer_add(buffer_state, batch)
+        block_ready(new_state)
+        t4b = time.perf_counter()
+        train_t_buffer_add += t4b - t4a
+        train_n_buffer_add += 1
+        return new_state
+
     # RTPT
     total_iterations = total_timesteps // (num_envs * config["SCAN_STEPS"]) + 1
     rtpt = RTPT(name_initials=config.get("NAME_INITIALS", "SA"), experiment_name=run_name, max_iterations=total_iterations)
@@ -743,12 +772,14 @@ def single_run(config: dict):
             train_t_transition += t3 - t2
             train_n_transition += 1
 
-            # 4. Add to buffer (block to capture GPU->CPU transfer + CPU insertion)
-            buffer_state = buffer_add(buffer_state, transition)
-            block_ready(buffer_state)
+            # 4. Batch buffer add: append on GPU, flush every TRAIN_ADD_BATCH_SIZE.
+            # The flush (GPU->CPU transfer + CPU scatter-add) is timed inside
+            # flush_train_pending, so the slow per-transition adds become rare.
+            train_pending.append(transition)
+            if len(train_pending) >= train_add_batch_size:
+                buffer_state = flush_train_pending(train_pending, buffer_state)
+                train_pending = []
             t4 = time.perf_counter()
-            train_t_buffer_add += t4 - t3
-            train_n_buffer_add += 1
 
             obs = next_obs
             global_step += num_envs
@@ -855,6 +886,11 @@ def single_run(config: dict):
                     t9 = time.perf_counter()
                     train_t_target_update += t9 - t8
                     train_n_target_update += 1
+
+        # Flush any transitions still pending in this iteration so they are
+        # committed to the buffer (keeps the buffer fresh across iterations).
+        buffer_state = flush_train_pending(train_pending, buffer_state)
+        train_pending = []
 
         # Logging
         if iteration % 1 == 0:
