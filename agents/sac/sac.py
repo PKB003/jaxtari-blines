@@ -542,6 +542,10 @@ def single_run(config: dict):
     key, reset_key = jax.random.split(key)
     obs, env_state = vmap_reset(jax.random.split(reset_key, num_envs))
 
+    # Keep the replay buffer on CPU by default to avoid exhausting GPU VRAM.
+    buffer_on_cpu = config.get("BUFFER_ON_CPU", True)
+    cpu_device = jax.devices("cpu")[0] if buffer_on_cpu else None
+
     # Replay buffer with flashbax
     dummy_transition = Transition(
         obs=obs,
@@ -550,6 +554,14 @@ def single_run(config: dict):
         next_obs=obs,
         done=jnp.zeros((config["NUM_ENVS"],), dtype=jnp.bool_),
     )
+    # Move the dummy transition to CPU BEFORE buffer.init so flashbax allocates
+    # the large buffer directly on CPU. This avoids materializing the buffer on
+    # GPU and then copying it to CPU (which would temporarily use ~1.4 GB VRAM).
+    if buffer_on_cpu:
+        dummy_transition = jax.tree.map(
+            lambda x: jax.device_put(x, cpu_device), dummy_transition
+        )
+
     buffer = fbx.make_item_buffer(
         max_length=config["BUFFER_SIZE"],
         min_length=config["BATCH_SIZE"],
@@ -559,12 +571,7 @@ def single_run(config: dict):
     )
     buffer_state = buffer.init(dummy_transition)
 
-    # Keep the replay buffer on CPU by default to avoid exhausting GPU VRAM.
-    buffer_on_cpu = config.get("BUFFER_ON_CPU", True)
     if buffer_on_cpu:
-        cpu_device = jax.devices("cpu")[0]
-        buffer_state = jax.device_put(buffer_state, cpu_device)
-
         @jax.jit(device=cpu_device)
         def buffer_add(state, transition):
             return buffer.add(state, transition)
@@ -638,13 +645,27 @@ def single_run(config: dict):
             # Update if buffer has enough samples
             if buffer_can_sample(buffer_state):
                 key, sample_key = jax.random.split(key)
+                # Sample on CPU (replay buffer lives on CPU to save VRAM).
                 batch = buffer_sample(buffer_state, sample_key).experience
+                # Remove env dims on CPU first (reduces transfer size).
                 batch = Transition(
-                    remove_env_dim(batch.obs).astype(jnp.float32),
-                    remove_env_dim(batch.action).astype(jnp.float32),
-                    remove_env_dim(batch.reward).astype(jnp.float32),
-                    remove_env_dim(batch.next_obs).astype(jnp.float32),
-                    remove_env_dim(batch.done).astype(jnp.float32),
+                    remove_env_dim(batch.obs),
+                    remove_env_dim(batch.action),
+                    remove_env_dim(batch.reward),
+                    remove_env_dim(batch.next_obs),
+                    remove_env_dim(batch.done),
+                )
+                # Move the sampled batch to GPU explicitly for learning.
+                # Obs stays uint8 during transfer to minimize data movement;
+                # conversion to float32 happens on GPU below.
+                if buffer_on_cpu:
+                    batch = jax.device_put(batch, jax.devices("gpu")[0])
+                batch = Transition(
+                    batch.obs.astype(jnp.float32),
+                    batch.action.astype(jnp.float32),
+                    batch.reward.astype(jnp.float32),
+                    batch.next_obs.astype(jnp.float32),
+                    batch.done.astype(jnp.float32),
                 )
                 # Get current alpha
                 if config["AUTOTUNE"]:
