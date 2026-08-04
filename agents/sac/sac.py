@@ -56,26 +56,6 @@ def get_gpu_stats():
         return -1, -1, -1
 
 
-# When True, block_ready() forces synchronous execution for profiling.
-# When False (production), block_ready() is a no-op so JAX can overlap
-# GPU compute and device transfers asynchronously (avoids pipeline stalls).
-PROFILE_TRAIN = False
-
-
-def block_ready(x):
-    """Safely block until all leaves of a pytree are ready (JAX is async).
-
-    No-op when PROFILE_TRAIN is False (production mode) to preserve JAX's
-    asynchronous execution and avoid forcing a sync per step.
-    """
-    if not PROFILE_TRAIN:
-        return x
-    return jax.tree.map(
-        lambda y: y.block_until_ready() if hasattr(y, "block_until_ready") else y,
-        x
-    )
-
-
 def make_env(
     env_id: str,
     mods: Optional[list] = None,
@@ -232,10 +212,6 @@ class Transition:
 def single_run(config: dict):
     # Convert config to uppercase
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
-
-    # Enable/disable synchronous profiling (block_until_ready) from config.
-    global PROFILE_TRAIN
-    PROFILE_TRAIN = config.get("PROFILE_TRAIN", False)
 
     if isinstance(config.get("TRAIN_MODS"), list):
         config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
@@ -726,26 +702,14 @@ def single_run(config: dict):
     global_step = 0
     start_time = time.time()
 
-    # Profiling accumulators (block_until_ready) — measure real execution time.
-    train_t_sample_action = 0.0; train_n_sample_action = 0
-    train_t_vmap_step = 0.0;      train_n_vmap_step = 0
-    train_t_transition = 0.0;     train_n_transition = 0
-    train_t_buffer_add = 0.0;     train_n_buffer_add = 0
-    train_t_buffer_sample = 0.0;  train_n_buffer_sample = 0
-    train_t_device_put = 0.0;     train_n_device_put = 0
-    train_t_update_qf = 0.0;      train_n_update_qf = 0
-    train_t_update_actor = 0.0;   train_n_update_actor = 0
-    train_t_target_update = 0.0;  train_n_target_update = 0
-
     # Batched training buffer adds: accumulate transitions on GPU, then flush the
-    # whole batch to CPU with a single buffer.add. Profiling showed per-transition
-    # buffer_add costs ~94ms (GPU->CPU transfer + full-buffer CPU scatter-add) and
-    # dominated training time (~83%). Batching mirrors the fill-loop fix.
+    # whole batch to CPU with a single buffer.add. This avoids a synchronous
+    # GPU->CPU transfer + full-buffer scatter-add per transition (which dominated
+    # training time before batching). Batching mirrors the fill-loop fix.
     train_add_batch_size = config.get("TRAIN_ADD_BATCH_SIZE", 8)
     train_pending = []
 
     def flush_train_pending(pending, buffer_state):
-        nonlocal train_t_buffer_add, train_n_buffer_add
         if not pending:
             return buffer_state
         # Stack (N, num_envs, ...) — matches flashbax item_buffer.add(add_batches=True).
@@ -758,13 +722,7 @@ def single_run(config: dict):
         )
         # Move the whole batch to CPU in a single transfer.
         batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
-        t4a = time.perf_counter()
-        new_state = buffer_add(buffer_state, batch)
-        block_ready(new_state)
-        t4b = time.perf_counter()
-        train_t_buffer_add += t4b - t4a
-        train_n_buffer_add += 1
-        return new_state
+        return buffer_add(buffer_state, batch)
 
     # RTPT
     total_iterations = total_timesteps // (num_envs * config["SCAN_STEPS"]) + 1
@@ -779,23 +737,14 @@ def single_run(config: dict):
 
         # Do SCAN_STEPS environment steps
         for local_step in range(steps_per_iteration):
-            # 1. Sample action
+            # Sample action
             key, subkey = jax.random.split(key)
-            t0 = time.perf_counter()
             action, key = sample_action(network_state.params, actor_state.params, obs, subkey)
-            block_ready(action)
-            t1 = time.perf_counter()
-            train_t_sample_action += t1 - t0
-            train_n_sample_action += 1
 
-            # 2. Step environment
+            # Step environment
             next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
-            block_ready(next_obs)
-            t2 = time.perf_counter()
-            train_t_vmap_step += t2 - t1
-            train_n_vmap_step += 1
 
-            # 3. Transition creation
+            # Add to buffer (batched: append on GPU, flush every TRAIN_ADD_BATCH_SIZE)
             transition = Transition(
                 obs.astype(jnp.uint8),
                 action.astype(jnp.float32),
@@ -803,18 +752,10 @@ def single_run(config: dict):
                 next_obs.astype(jnp.uint8),
                 next_done.astype(jnp.bool_)
             )
-            t3 = time.perf_counter()
-            train_t_transition += t3 - t2
-            train_n_transition += 1
-
-            # 4. Batch buffer add: append on GPU, flush every TRAIN_ADD_BATCH_SIZE.
-            # The flush (GPU->CPU transfer + CPU scatter-add) is timed inside
-            # flush_train_pending, so the slow per-transition adds become rare.
             train_pending.append(transition)
             if len(train_pending) >= train_add_batch_size:
                 buffer_state = flush_train_pending(train_pending, buffer_state)
                 train_pending = []
-            t4 = time.perf_counter()
 
             obs = next_obs
             global_step += num_envs
@@ -822,12 +763,8 @@ def single_run(config: dict):
             # Update if buffer has enough samples
             if buffer_can_sample(buffer_state):
                 key, sample_key = jax.random.split(key)
-                # 5. Sample on CPU (replay buffer lives on CPU to save VRAM).
+                # Sample on CPU (replay buffer lives on CPU to save VRAM).
                 batch = buffer_sample(buffer_state, sample_key).experience
-                block_ready(batch)
-                t5 = time.perf_counter()
-                train_t_buffer_sample += t5 - t4
-                train_n_buffer_sample += 1
                 # Remove env dims on CPU first (reduces transfer size).
                 batch = Transition(
                     remove_env_dim(batch.obs),
@@ -836,15 +773,11 @@ def single_run(config: dict):
                     remove_env_dim(batch.next_obs),
                     remove_env_dim(batch.done),
                 )
-                # 6. Move the sampled batch to GPU explicitly for learning.
+                # Move the sampled batch to GPU explicitly for learning.
                 # Obs stays uint8 during transfer to minimize data movement;
                 # conversion to float32 happens on GPU below.
                 if buffer_on_cpu:
                     batch = jax.device_put(batch, jax.devices("gpu")[0])
-                block_ready(batch)
-                t6 = time.perf_counter()
-                train_t_device_put += t6 - t5
-                train_n_device_put += 1
                 batch = Transition(
                     batch.obs.astype(jnp.float32),
                     batch.action.astype(jnp.float32),
@@ -858,7 +791,7 @@ def single_run(config: dict):
                 else:
                     current_alpha = config["ALPHA"]
 
-                # 7. Q update (every step after learning starts, like CleanRL)
+                # Q update (every step after learning starts, like CleanRL)
                 # Encoder is also updated here (gradient from Q-loss).
                 (qf1_state, qf2_state, network_state, qf_loss, qf1_loss, qf2_loss,
                  qf1_values, qf2_values, next_q_values, key) = update_qf(
@@ -866,13 +799,8 @@ def single_run(config: dict):
                     qf1_target_params, qf2_target_params,
                     actor_state, current_alpha, batch, key,
                 )
-                block_ready((qf1_state, qf2_state, network_state, qf1_values, qf2_values, next_q_values))
-                t7 = time.perf_counter()
-                train_t_update_qf += t7 - t6
-                train_n_update_qf += 1
-                t8 = t7  # default: if actor update does not run, target update is measured from end of Q update
 
-                # 8. Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
+                # Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
                 # The loop matches CleanRL exactly: update the actor POLICY_FREQUENCY
                 # times on the same batch to compensate for the delayed update.
                 # The encoder is NOT updated here (see update_actor_and_alpha).
@@ -896,24 +824,16 @@ def single_run(config: dict):
                             batch,
                             key,
                         )
-                    block_ready((actor_state, alpha_state, current_alpha))
-                    t8 = time.perf_counter()
-                    train_t_update_actor += t8 - t7
-                    train_n_update_actor += 1
                 else:
                     actor_loss = jnp.array(0.0)
                     log_prob_mean = jnp.array(0.0)
                     alpha_loss = jnp.array(0.0)
 
-                # 9. Target network update (every TARGET_NETWORK_FREQUENCY steps)
+                # Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
                     qf1_target_params, qf2_target_params = target_update(
                         qf1_state, qf2_state, qf1_target_params, qf2_target_params, config["TAU"]
                     )
-                    block_ready((qf1_target_params, qf2_target_params))
-                    t9 = time.perf_counter()
-                    train_t_target_update += t9 - t8
-                    train_n_target_update += 1
 
         # Flush any transitions still pending in this iteration so they are
         # committed to the buffer (keeps the buffer fresh across iterations).
@@ -957,19 +877,6 @@ def single_run(config: dict):
     print("Training finished.")
     train_elapsed = time.time() - start_time
     print(f"[TRAIN] elapsed={train_elapsed:.2f}s SPS={global_step / (train_elapsed + 1e-8):.1f}")
-    print("[TRAIN] stage profiling (block_until_ready):")
-    for name, t, n in [
-        ("sample_action", train_t_sample_action, train_n_sample_action),
-        ("vmap_step", train_t_vmap_step, train_n_vmap_step),
-        ("transition", train_t_transition, train_n_transition),
-        ("buffer_add", train_t_buffer_add, train_n_buffer_add),
-        ("buffer_sample", train_t_buffer_sample, train_n_buffer_sample),
-        ("device_put", train_t_device_put, train_n_device_put),
-        ("update_qf", train_t_update_qf, train_n_update_qf),
-        ("update_actor", train_t_update_actor, train_n_update_actor),
-        ("target_update", train_t_target_update, train_n_target_update),
-    ]:
-        print(f"  {name:<16} n={n:<6} total={t:.2f}s avg={t / max(n, 1) * 1000:.3f}ms")
     used_mb, total_mb, util = get_gpu_stats()
     print(f"[TRAIN] GPU mem={used_mb}/{total_mb}MB util={util}%")
 
