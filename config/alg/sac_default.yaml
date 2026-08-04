@@ -5,7 +5,9 @@ PIXEL_BASED: True
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 1000000
-BUFFER_SIZE: 1000000
+# 50k buffer keeps flashbax's full-buffer scatter-add cheap on CPU.
+# (1M buffer = ~56GB CPU state; 50k = ~2.8GB, ~20x cheaper per add.)
+BUFFER_SIZE: 50000
 LEARNING_STARTS: 5000
 SCAN_STEPS: 1000
 
@@ -32,9 +34,11 @@ BUFFER_ON_CPU: True
 # the initial replay-buffer warmup (which was the dominant fill cost).
 FILL_BATCH_SIZE: 256
 
-# Same batching for the training loop's buffer.add calls. Profiling with
-# block_until_ready showed per-transition buffer_add costs ~94ms (GPU->CPU
-# transfer + full-buffer CPU scatter-add) and dominated training time (~83%).
 # Accumulating a few transitions on GPU and flushing them together reduces
 # the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
-TRAIN_ADD_BATCH_SIZE: 8
+TRAIN_ADD_BATCH_SIZE: 32
+
+# When True, block_until_ready() forces synchronous execution per step for
+# profiling. When False (production), JAX overlaps GPU compute and transfers
+# asynchronously, avoiding pipeline stalls and giving higher SPS.
+PROFILE_TRAIN: False

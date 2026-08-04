@@ -56,8 +56,20 @@ def get_gpu_stats():
         return -1, -1, -1
 
 
+# When True, block_ready() forces synchronous execution for profiling.
+# When False (production), block_ready() is a no-op so JAX can overlap
+# GPU compute and device transfers asynchronously (avoids pipeline stalls).
+PROFILE_TRAIN = False
+
+
 def block_ready(x):
-    """Safely block until all leaves of a pytree are ready (JAX is async)."""
+    """Safely block until all leaves of a pytree are ready (JAX is async).
+
+    No-op when PROFILE_TRAIN is False (production mode) to preserve JAX's
+    asynchronous execution and avoid forcing a sync per step.
+    """
+    if not PROFILE_TRAIN:
+        return x
     return jax.tree.map(
         lambda y: y.block_until_ready() if hasattr(y, "block_until_ready") else y,
         x
@@ -131,11 +143,19 @@ class Network(nn.Module):
         if x.ndim == 6:
             # (batch, env, stack, H, W, C)
             b, n_env, stack, h, w, c = x.shape
+            # Move the stack axis next to the channel axis before reshaping,
+            # so the channel axis becomes (stack * C) of the SAME pixel rather
+            # than stacking consecutive spatial pixels (which would corrupt the
+            # image for the CNN).
+            x = jnp.transpose(x, (0, 1, 3, 4, 2, 5))
             x = x.reshape((b * n_env, h, w, stack * c))
 
         elif x.ndim == 5:
             # (batch, stack, H, W, C)
             b, stack, h, w, c = x.shape
+            # Transpose (batch, H, W, stack, C) then reshape: channel axis =
+            # (stack * C) at the same spatial pixel (frame stacking order).
+            x = jnp.transpose(x, (0, 2, 3, 1, 4))
             x = x.reshape((b, h, w, stack * c))
 
         x = x.astype(jnp.float32) / 255.0
@@ -212,6 +232,10 @@ class Transition:
 def single_run(config: dict):
     # Convert config to uppercase
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
+
+    # Enable/disable synchronous profiling (block_until_ready) from config.
+    global PROFILE_TRAIN
+    PROFILE_TRAIN = config.get("PROFILE_TRAIN", False)
 
     if isinstance(config.get("TRAIN_MODS"), list):
         config["TRAIN_MODS"] = tuple(config["TRAIN_MODS"])
@@ -473,6 +497,17 @@ def single_run(config: dict):
 
         return (new_actor_state, new_alpha_state, new_alpha,
                 actor_loss, log_prob.mean(), alpha_loss, key)
+
+    @jax.jit
+    def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params, tau):
+        """Soft-update target networks (jitted to avoid per-call kernel dispatch)."""
+        new_qf1_target_params = optax.incremental_update(
+            qf1_state.params, qf1_target_params, tau
+        )
+        new_qf2_target_params = optax.incremental_update(
+            qf2_state.params, qf2_target_params, tau
+        )
+        return new_qf1_target_params, new_qf2_target_params
 
     # ---------- Save and eval function ----------
     def save_and_eval(iteration, network_state, actor_state, qf1_state, qf2_state):
@@ -748,14 +783,14 @@ def single_run(config: dict):
             key, subkey = jax.random.split(key)
             t0 = time.perf_counter()
             action, key = sample_action(network_state.params, actor_state.params, obs, subkey)
-            action.block_until_ready()
+            block_ready(action)
             t1 = time.perf_counter()
             train_t_sample_action += t1 - t0
             train_n_sample_action += 1
 
             # 2. Step environment
             next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
-            next_obs.block_until_ready()
+            block_ready(next_obs)
             t2 = time.perf_counter()
             train_t_vmap_step += t2 - t1
             train_n_vmap_step += 1
@@ -872,15 +907,8 @@ def single_run(config: dict):
 
                 # 9. Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
-                    qf1_target_params = optax.incremental_update(
-                        qf1_state.params,
-                        qf1_target_params,
-                        config["TAU"],
-                    )
-                    qf2_target_params = optax.incremental_update(
-                        qf2_state.params,
-                        qf2_target_params,
-                        config["TAU"],
+                    qf1_target_params, qf2_target_params = target_update(
+                        qf1_state, qf2_state, qf1_target_params, qf2_target_params, config["TAU"]
                     )
                     block_ready((qf1_target_params, qf2_target_params))
                     t9 = time.perf_counter()
