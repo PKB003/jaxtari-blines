@@ -5,8 +5,6 @@ PIXEL_BASED: True
 NATIVE_DOWNSCALING: True
 
 TOTAL_TIMESTEPS: 1000000
-# 50k buffer keeps flashbax's full-buffer scatter-add cheap on CPU.
-# (1M buffer = ~56GB CPU state; 50k = ~2.8GB, ~20x cheaper per add.)
 BUFFER_SIZE: 50000
 LEARNING_STARTS: 5000
 SCAN_STEPS: 1000
@@ -29,16 +27,9 @@ TARGET_NETWORK_FREQUENCY: 1
 BUFFER_ON_CPU: True
 
 # Number of transitions to accumulate on GPU before transferring the whole
-# batch to CPU and calling buffer.add once. Batching avoids a synchronous
-# GPU->CPU device transfer + full-buffer scatter-add per transition during
-# the initial replay-buffer warmup (which was the dominant fill cost).
+# batch to CPU and calling buffer.add once.
 FILL_BATCH_SIZE: 256
 
 # Accumulating a few transitions on GPU and flushing them together reduces
 # the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
-TRAIN_ADD_BATCH_SIZE: 8
-
-# When True, block_until_ready() forces synchronous execution per step for
-# profiling. When False (production), JAX overlaps GPU compute and transfers
-# asynchronously, avoiding pipeline stalls and giving higher SPS.
-PROFILE_TRAIN: False
+TRAIN_ADD_BATCH_SIZE: 16

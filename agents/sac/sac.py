@@ -249,6 +249,10 @@ def single_run(config: dict):
     action_dim = action_space.shape[0]
     low = jnp.array(action_space.low)
     high = jnp.array(action_space.high)
+    # CleanRL action_scale = (high - low) / 2, used in the tanh log-prob
+    # correction (log-det-Jacobian). Confirmed by compare_sac_math.py as the
+    # first divergence from CleanRL.
+    action_scale = (high - low) / 2.0
 
     # Vectorized environment wrappers
     @jax.jit
@@ -373,7 +377,8 @@ def single_run(config: dict):
         next_log_prob = -0.5 * (((next_z - next_mean) / (next_std + 1e-8)) ** 2
                                  + 2 * jnp.log(next_std + 1e-8) + jnp.log(2 * jnp.pi))
         next_log_prob = next_log_prob.sum(axis=-1)
-        next_log_prob -= jnp.log(1 - next_action**2 + 1e-6).sum(axis=-1)
+        # CleanRL tanh log-prob correction incl. action_scale (log-det-Jacobian)
+        next_log_prob -= jnp.log(action_scale * (1 - next_action**2) + 1e-6).sum(axis=-1)
 
         # The Q network takes the raw tanh action (in [-1, 1])
         qf1_next_target = qf1.apply(qf1_target_params, next_hidden, next_action).squeeze(-1)
@@ -442,7 +447,8 @@ def single_run(config: dict):
             log_prob = -0.5 * (((z - mean) / (std + 1e-8)) ** 2
                                 + 2 * jnp.log(std + 1e-8) + jnp.log(2 * jnp.pi))
             log_prob = log_prob.sum(axis=-1)
-            log_prob -= jnp.log(1 - action**2 + 1e-6).sum(axis=-1)
+            # CleanRL tanh log-prob correction incl. action_scale (log-det-Jacobian)
+            log_prob -= jnp.log(action_scale * (1 - action**2) + 1e-6).sum(axis=-1)
 
             qf1_pi = qf1.apply(qf1_state.params, hidden, action).squeeze(-1)
             qf2_pi = qf2.apply(qf2_state.params, hidden, action).squeeze(-1)
@@ -454,6 +460,34 @@ def single_run(config: dict):
             actor_state.params
         )
         new_actor_state = actor_state.apply_gradients(grads=actor_grads)
+
+        # ---- TEMPORARY diagnostics (A/B validation of action_scale fix) ----
+        # Recompute sampled action / log_std / log_prob with current params
+        # for monitoring only (no gradient effect).
+        mean_diag, log_std_diag = actor.apply(new_actor_state.params, hidden)
+        std_diag = jnp.exp(log_std_diag)
+        key_diag, noise_key_diag = jax.random.split(key)
+        z_diag = mean_diag + std_diag * jax.random.normal(noise_key_diag, shape=mean_diag.shape)
+        action_diag = jnp.tanh(z_diag)
+        log_prob_diag = -0.5 * (((z_diag - mean_diag) / (std_diag + 1e-8)) ** 2
+                                + 2 * jnp.log(std_diag + 1e-8) + jnp.log(2 * jnp.pi))
+        log_prob_diag = log_prob_diag.sum(axis=-1)
+        log_prob_diag -= jnp.log(action_scale * (1 - action_diag**2) + 1e-6).sum(axis=-1)
+        action_rescaled = low + (action_diag + 1.0) * (high - low) / 2.0
+        debug = {
+            "action_tanh_mean": action_diag.mean(),
+            "action_tanh_abs_mean": jnp.abs(action_diag).mean(),
+            "action_tanh_max": jnp.abs(action_diag).max(),
+            "log_std_mean": log_std_diag.mean(),
+            "log_std_min": log_std_diag.min(),
+            "log_std_max": log_std_diag.max(),
+            "log_prob_mean": log_prob_diag.mean(),
+            "entropy_gap": (log_prob_diag + target_entropy).mean(),
+            "alpha": alpha,
+            "env_action_mean_dim0": action_rescaled[..., 0].mean(),
+            "env_action_mean_dim1": action_rescaled[..., 1].mean(),
+            "env_action_mean_dim2": action_rescaled[..., 2].mean(),
+        }
 
         # Alpha update (if autotune)
         if config["AUTOTUNE"]:
@@ -472,7 +506,7 @@ def single_run(config: dict):
             new_alpha = alpha
 
         return (new_actor_state, new_alpha_state, new_alpha,
-                actor_loss, log_prob.mean(), alpha_loss, key)
+                actor_loss, log_prob.mean(), alpha_loss, debug, key)
 
     @jax.jit
     def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params, tau):
@@ -813,6 +847,7 @@ def single_run(config: dict):
                             actor_loss,
                             log_prob_mean,
                             alpha_loss,
+                            debug,
                             key,
                         ) = update_actor_and_alpha(
                             network_state.params,
@@ -828,6 +863,20 @@ def single_run(config: dict):
                     actor_loss = jnp.array(0.0)
                     log_prob_mean = jnp.array(0.0)
                     alpha_loss = jnp.array(0.0)
+                    debug = {
+                        "action_tanh_mean": jnp.array(0.0),
+                        "action_tanh_abs_mean": jnp.array(0.0),
+                        "action_tanh_max": jnp.array(0.0),
+                        "log_std_mean": jnp.array(0.0),
+                        "log_std_min": jnp.array(0.0),
+                        "log_std_max": jnp.array(0.0),
+                        "log_prob_mean": jnp.array(0.0),
+                        "entropy_gap": jnp.array(0.0),
+                        "alpha": current_alpha,
+                        "env_action_mean_dim0": jnp.array(0.0),
+                        "env_action_mean_dim1": jnp.array(0.0),
+                        "env_action_mean_dim2": jnp.array(0.0),
+                    }
 
                 # Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
@@ -863,6 +912,19 @@ def single_run(config: dict):
                 "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
+                # ---- TEMPORARY diagnostics (A/B validation) ----
+                "debug/action_tanh_mean": debug["action_tanh_mean"],
+                "debug/action_tanh_abs_mean": debug["action_tanh_abs_mean"],
+                "debug/action_tanh_max": debug["action_tanh_max"],
+                "debug/log_std_mean": debug["log_std_mean"],
+                "debug/log_std_min": debug["log_std_min"],
+                "debug/log_std_max": debug["log_std_max"],
+                "debug/log_prob_mean": debug["log_prob_mean"],
+                "debug/entropy_gap": debug["entropy_gap"],
+                "debug/alpha": debug["alpha"],
+                "debug/env_action_mean_dim0": debug["env_action_mean_dim0"],
+                "debug/env_action_mean_dim1": debug["env_action_mean_dim1"],
+                "debug/env_action_mean_dim2": debug["env_action_mean_dim2"],
             })
             wandb.log(metrics, step=global_step)
 
