@@ -518,6 +518,7 @@ def single_run(config: dict):
             "alpha": alpha,
             # Existing extra diagnostics
             "action_tanh_mean": action_diag.mean(),
+            "action_tanh_abs_mean": jnp.abs(action_diag).mean(),
             "action_tanh_max": jnp.abs(action_diag).max(),
             "entropy_gap": (log_prob_diag + target_entropy).mean(),
             "env_action_mean_dim0": action_rescaled[..., 0].mean(),
