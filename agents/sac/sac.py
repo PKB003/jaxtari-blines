@@ -461,7 +461,7 @@ def single_run(config: dict):
         )
         new_actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-        # ---- TEMPORARY diagnostics (A/B validation of action_scale fix) ----
+        # ---- TEMPORARY diagnostics (Stage 5 actor entropy failure isolation) ----
         # Recompute sampled action / log_std / log_prob with current params
         # for monitoring only (no gradient effect).
         mean_diag, log_std_diag = actor.apply(new_actor_state.params, hidden)
@@ -469,21 +469,57 @@ def single_run(config: dict):
         key_diag, noise_key_diag = jax.random.split(key)
         z_diag = mean_diag + std_diag * jax.random.normal(noise_key_diag, shape=mean_diag.shape)
         action_diag = jnp.tanh(z_diag)
-        log_prob_diag = -0.5 * (((z_diag - mean_diag) / (std_diag + 1e-8)) ** 2
-                                + 2 * jnp.log(std_diag + 1e-8) + jnp.log(2 * jnp.pi))
-        log_prob_diag = log_prob_diag.sum(axis=-1)
-        log_prob_diag -= jnp.log(action_scale * (1 - action_diag**2) + 1e-6).sum(axis=-1)
+
+        # Gaussian log prob (pre-tanh)
+        gauss_log_prob_diag = -0.5 * (((z_diag - mean_diag) / (std_diag + 1e-8)) ** 2
+                                      + 2 * jnp.log(std_diag + 1e-8) + jnp.log(2 * jnp.pi))
+        gauss_log_prob_diag = gauss_log_prob_diag.sum(axis=-1)
+        # Tanh correction (log-det-Jacobian) with action_scale
+        tanh_corr_diag = -jnp.log(action_scale * (1 - action_diag**2) + 1e-6).sum(axis=-1)
+        log_prob_diag = gauss_log_prob_diag + tanh_corr_diag
         action_rescaled = low + (action_diag + 1.0) * (high - low) / 2.0
+
+        # Actor loss decomposition (entropy_term = alpha*log_prob, q_term = -min_q)
+        qf1_pi_diag = qf1.apply(qf1_state.params, hidden, action_diag).squeeze(-1)
+        qf2_pi_diag = qf2.apply(qf2_state.params, hidden, action_diag).squeeze(-1)
+        min_qf_pi_diag = jnp.minimum(qf1_pi_diag, qf2_pi_diag)
+        entropy_term_diag = alpha * log_prob_diag
+        q_term_diag = -min_qf_pi_diag
+
         debug = {
-            "action_tanh_mean": action_diag.mean(),
-            "action_tanh_abs_mean": jnp.abs(action_diag).mean(),
-            "action_tanh_max": jnp.abs(action_diag).max(),
+            # Actor distribution
+            "actor_mean_mean": mean_diag.mean(),
+            "actor_mean_min": mean_diag.min(),
+            "actor_mean_max": mean_diag.max(),
             "log_std_mean": log_std_diag.mean(),
             "log_std_min": log_std_diag.min(),
             "log_std_max": log_std_diag.max(),
+            "std_mean": std_diag.mean(),
+            # Pre-tanh latent z
+            "z_mean": z_diag.mean(),
+            "z_std": z_diag.std(),
+            "z_min": z_diag.min(),
+            "z_max": z_diag.max(),
+            "fraction_abs_z_gt_5": (jnp.abs(z_diag) > 5.0).mean(),
+            "fraction_abs_z_gt_10": (jnp.abs(z_diag) > 10.0).mean(),
+            # Tanh saturation
+            "mean_abs_tanh": jnp.abs(action_diag).mean(),
+            "fraction_abs_tanh_gt_0p99": (jnp.abs(action_diag) > 0.99).mean(),
+            "fraction_abs_tanh_gt_0p999": (jnp.abs(action_diag) > 0.999).mean(),
+            # Log prob decomposition
+            "gaussian_log_prob_mean": gauss_log_prob_diag.mean(),
+            "tanh_correction_mean": tanh_corr_diag.mean(),
             "log_prob_mean": log_prob_diag.mean(),
-            "entropy_gap": (log_prob_diag + target_entropy).mean(),
+            # Actor loss decomposition
+            "entropy_term_mean": entropy_term_diag.mean(),
+            "q_term_mean": q_term_diag.mean(),
+            # Alpha
+            "log_alpha": jnp.log(alpha),
             "alpha": alpha,
+            # Existing extra diagnostics
+            "action_tanh_mean": action_diag.mean(),
+            "action_tanh_max": jnp.abs(action_diag).max(),
+            "entropy_gap": (log_prob_diag + target_entropy).mean(),
             "env_action_mean_dim0": action_rescaled[..., 0].mean(),
             "env_action_mean_dim1": action_rescaled[..., 1].mean(),
             "env_action_mean_dim2": action_rescaled[..., 2].mean(),
@@ -876,6 +912,24 @@ def single_run(config: dict):
                         "env_action_mean_dim0": jnp.array(0.0),
                         "env_action_mean_dim1": jnp.array(0.0),
                         "env_action_mean_dim2": jnp.array(0.0),
+                        "actor_mean_mean": jnp.array(0.0),
+                        "actor_mean_min": jnp.array(0.0),
+                        "actor_mean_max": jnp.array(0.0),
+                        "std_mean": jnp.array(0.0),
+                        "z_mean": jnp.array(0.0),
+                        "z_std": jnp.array(0.0),
+                        "z_min": jnp.array(0.0),
+                        "z_max": jnp.array(0.0),
+                        "fraction_abs_z_gt_5": jnp.array(0.0),
+                        "fraction_abs_z_gt_10": jnp.array(0.0),
+                        "mean_abs_tanh": jnp.array(0.0),
+                        "fraction_abs_tanh_gt_0p99": jnp.array(0.0),
+                        "fraction_abs_tanh_gt_0p999": jnp.array(0.0),
+                        "gaussian_log_prob_mean": jnp.array(0.0),
+                        "tanh_correction_mean": jnp.array(0.0),
+                        "entropy_term_mean": jnp.array(0.0),
+                        "q_term_mean": jnp.array(0.0),
+                        "log_alpha": jnp.array(0.0),
                     }
 
                 # Target network update (every TARGET_NETWORK_FREQUENCY steps)
@@ -913,13 +967,32 @@ def single_run(config: dict):
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
                 # ---- TEMPORARY diagnostics (A/B validation) ----
+                # ---- TEMPORARY diagnostics (Stage 5 actor entropy) ----
                 "debug/action_tanh_mean": debug["action_tanh_mean"],
                 "debug/action_tanh_abs_mean": debug["action_tanh_abs_mean"],
                 "debug/action_tanh_max": debug["action_tanh_max"],
+                "debug/actor_mean_mean": debug["actor_mean_mean"],
+                "debug/actor_mean_min": debug["actor_mean_min"],
+                "debug/actor_mean_max": debug["actor_mean_max"],
                 "debug/log_std_mean": debug["log_std_mean"],
                 "debug/log_std_min": debug["log_std_min"],
                 "debug/log_std_max": debug["log_std_max"],
+                "debug/std_mean": debug["std_mean"],
+                "debug/z_mean": debug["z_mean"],
+                "debug/z_std": debug["z_std"],
+                "debug/z_min": debug["z_min"],
+                "debug/z_max": debug["z_max"],
+                "debug/fraction_abs_z_gt_5": debug["fraction_abs_z_gt_5"],
+                "debug/fraction_abs_z_gt_10": debug["fraction_abs_z_gt_10"],
+                "debug/mean_abs_tanh": debug["mean_abs_tanh"],
+                "debug/fraction_abs_tanh_gt_0p99": debug["fraction_abs_tanh_gt_0p99"],
+                "debug/fraction_abs_tanh_gt_0p999": debug["fraction_abs_tanh_gt_0p999"],
+                "debug/gaussian_log_prob_mean": debug["gaussian_log_prob_mean"],
+                "debug/tanh_correction_mean": debug["tanh_correction_mean"],
                 "debug/log_prob_mean": debug["log_prob_mean"],
+                "debug/entropy_term_mean": debug["entropy_term_mean"],
+                "debug/q_term_mean": debug["q_term_mean"],
+                "debug/log_alpha": debug["log_alpha"],
                 "debug/entropy_gap": debug["entropy_gap"],
                 "debug/alpha": debug["alpha"],
                 "debug/env_action_mean_dim0": debug["env_action_mean_dim0"],

@@ -32,4 +32,4 @@ FILL_BATCH_SIZE: 256
 
 # Accumulating a few transitions on GPU and flushing them together reduces
 # the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
-TRAIN_ADD_BATCH_SIZE: 16
+TRAIN_ADD_BATCH_SIZE: 32
