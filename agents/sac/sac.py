@@ -117,10 +117,23 @@ def make_env(
 
 # ---------- Networks ----------
 class CNNEncoder(nn.Module):
-    """CNN Encoder for pixel observations."""
+    """CNN Encoder for pixel observations.
+
+    Accepts the jaxatari observation layout:
+      (B, stack, H, W, C)  e.g. (1, 4, 84, 84, 1)
+    and reshapes to (B, H, W, stack*C) before the conv layers.
+    Also tolerates a plain 4D (B, C, H, W) input.
+    """
     @nn.compact
     def __call__(self, x):
-        x = jnp.transpose(x, (0, 2, 3, 1))
+        if x.ndim == 5:
+            # (B, stack, H, W, C) -> (B, H, W, stack*C)
+            b, stack, h, w, c = x.shape
+            x = jnp.transpose(x, (0, 2, 3, 1, 4))
+            x = x.reshape((b, h, w, stack * c))
+        elif x.ndim == 4:
+            # (B, C, H, W) -> (B, H, W, C)
+            x = jnp.transpose(x, (0, 2, 3, 1))
         x = x.astype(jnp.float32) / 255.0
         x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
                     kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
@@ -138,10 +151,15 @@ class CNNEncoder(nn.Module):
 
 
 class MLPEncoder(nn.Module):
-    """MLP for object-centric observations."""
+    """MLP for object-centric observations.
+
+    The input dimension is inferred from the observation at call time
+    (Dense infers its input features), so no hardcoded obs dim is used.
+    Output dimension is 512 to match the CNN encoder.
+    """
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(461, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+        x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
         x = nn.Dense(512, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
