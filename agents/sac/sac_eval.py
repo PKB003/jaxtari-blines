@@ -22,14 +22,14 @@ def evaluate(
         make_env: function that creates the environment
         env_id: environment id
         eval_episodes: number of episodes to run
-        Model: tuple of (NetworkClass, ActorClass, SoftQNetworkClass)
+        Model: tuple of (EncoderClass, ActorClass, SoftQNetworkClass)
         seed: random seed
     Returns:
         episodic_returns: (eval_episodes,) array of total rewards per episode
         env_states_until_done: environment states for the first episode (for video)
     """
     env: JaxEnvironment | JaxatariWrapper = make_env(env_id)()
-    _Network, _Actor, _SoftQNetwork = Model
+    _Encoder, _Actor, _SoftQNetwork = Model
     key = jax.random.key(seed)
 
     @jax.jit
@@ -54,10 +54,15 @@ def evaluate(
         return next_obs, next_state, reward, done, info
 
     key, reset_key = jax.random.split(key)
-    network = _Network()
+    actor_encoder = _Encoder()
     actor = _Actor(action_dim=env.action_space().shape[0])
-    qf = _SoftQNetwork(action_dim=env.action_space().shape[0])
-    key, network_key, actor_key, qf_key = jax.random.split(key, 4)
+    critic1_encoder = _Encoder()
+    critic2_encoder = _Encoder()
+    qf1 = _SoftQNetwork()
+    qf2 = _SoftQNetwork()
+    key, actor_encoder_key, actor_key, critic1_encoder_key, qf1_key, critic2_encoder_key, qf2_key = (
+        jax.random.split(key, 7)
+    )
     sample_obs = env.observation_space().sample(jax.random.PRNGKey(0))
     if sample_obs.ndim == 3:
         sample_obs = sample_obs[None, ..., None]
@@ -65,38 +70,53 @@ def evaluate(
         sample_obs = sample_obs[None, ...]
 
     sample_obs = sample_obs.astype(jnp.float32)
-    network_params = network.init(network_key, sample_obs)
-    hidden = network.apply(network_params, sample_obs)
-    actor_params = actor.init(actor_key, hidden)
-    dummy_action = jnp.zeros((1, env.action_space().shape[0]))
-    qf_params = qf.init(qf_key, hidden, dummy_action)
 
-    # Load model: saved as [config, [network_params, actor_params, qf1_params, qf2_params]]
+    # Actor: encoder + Gaussian policy head
+    actor_encoder_params = actor_encoder.init(actor_encoder_key, sample_obs)
+    actor_hidden = actor_encoder.apply(actor_encoder_params, sample_obs)
+    actor_params = actor.init(actor_key, actor_hidden)
+
+    # Critic 1: encoder + Q1 head
+    critic1_encoder_params = critic1_encoder.init(critic1_encoder_key, sample_obs)
+    critic1_hidden = critic1_encoder.apply(critic1_encoder_params, sample_obs)
+    dummy_action = jnp.zeros((1, env.action_space().shape[0]))
+    qf1_params = qf1.init(qf1_key, critic1_hidden, dummy_action)
+
+    # Critic 2: encoder + Q2 head
+    critic2_encoder_params = critic2_encoder.init(critic2_encoder_key, sample_obs)
+    critic2_hidden = critic2_encoder.apply(critic2_encoder_params, sample_obs)
+    qf2_params = qf2.init(qf2_key, critic2_hidden, dummy_action)
+
+    actor_params = {"encoder": actor_encoder_params, "actor": actor_params}
+    critic1_params = {"encoder": critic1_encoder_params, "qf": qf1_params}
+    critic2_params = {"encoder": critic2_encoder_params, "qf": qf2_params}
+
+    # Load model: saved as [config, [actor_params, critic1_params, critic2_params]]
     with open(model_path, "rb") as f:
-        (args, (network_params, actor_params, qf1_params, qf2_params)) = flax.serialization.from_bytes(
-            (None, (network_params, actor_params, qf_params, qf_params)), f.read()
+        (args, (actor_params, critic1_params, critic2_params)) = flax.serialization.from_bytes(
+            (None, (actor_params, critic1_params, critic2_params)), f.read()
         )
 
     low = jnp.array(env.action_space().low)
     high = jnp.array(env.action_space().high)
 
     @jax.jit
-    def get_action(network_params, actor_params, next_obs, key):
+    def get_action(actor_params, next_obs, key):
         """Deterministic action (mean, no noise) for evaluation."""
         if next_obs.ndim == 4:
             next_obs = next_obs[None, ...]
 
-        hidden = network.apply(network_params, next_obs)
+        hidden = actor_encoder.apply(actor_params["encoder"], next_obs)
         hidden = hidden.squeeze(0)
-        mean, _ = actor.apply(actor_params, hidden)
+        mean, _ = actor.apply(actor_params["actor"], hidden)
         action_tanh = jnp.tanh(mean)
         action = low + (action_tanh + 1.0) * (high - low) / 2.0
         return action, key
 
     def step_fn(carry, _):
         next_obs, env_state, keys = carry
-        actions, keys = jax.vmap(get_action, in_axes=(None, None, 0, 0))(
-            network_params, actor_params, next_obs, keys
+        actions, keys = jax.vmap(get_action, in_axes=(None, 0, 0))(
+            actor_params, next_obs, keys
         )
         next_obs, env_state, reward, done, infos = jax.vmap(wrapped_step)(env_state, actions)
         first_states = jax.tree.map(lambda x: x[0], env_state)

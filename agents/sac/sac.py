@@ -116,28 +116,11 @@ def make_env(
 
 
 # ---------- Networks ----------
-class Network(nn.Module):
-    """CNN for pixel observations."""
+class CNNEncoder(nn.Module):
+    """CNN Encoder for pixel observations."""
     @nn.compact
     def __call__(self, x):
-        if x.ndim == 6:
-            # (batch, env, stack, H, W, C)
-            b, n_env, stack, h, w, c = x.shape
-            # Move the stack axis next to the channel axis before reshaping,
-            # so the channel axis becomes (stack * C) of the SAME pixel rather
-            # than stacking consecutive spatial pixels (which would corrupt the
-            # image for the CNN).
-            x = jnp.transpose(x, (0, 1, 3, 4, 2, 5))
-            x = x.reshape((b * n_env, h, w, stack * c))
-
-        elif x.ndim == 5:
-            # (batch, stack, H, W, C)
-            b, stack, h, w, c = x.shape
-            # Transpose (batch, H, W, stack, C) then reshape: channel axis =
-            # (stack * C) at the same spatial pixel (frame stacking order).
-            x = jnp.transpose(x, (0, 2, 3, 1, 4))
-            x = x.reshape((b, h, w, stack * c))
-
+        x = jnp.transpose(x, (0, 2, 3, 1))
         x = x.astype(jnp.float32) / 255.0
         x = nn.Conv(32, kernel_size=(8, 8), strides=(4, 4), padding="VALID",
                     kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
@@ -154,7 +137,7 @@ class Network(nn.Module):
         return x
 
 
-class MLP_Network(nn.Module):
+class MLPEncoder(nn.Module):
     """MLP for object-centric observations."""
     @nn.compact
     def __call__(self, x):
@@ -186,9 +169,7 @@ class Actor(nn.Module):
 
 
 class SoftQNetwork(nn.Module):
-    """Q(s,a) network: takes hidden features + action, concatenates them."""
-    action_dim: int
-
+    """Q(s,a) network (Critic): takes hidden features + action, concatenates them."""
     @nn.compact
     def __call__(self, x, a):
         # Concatenate hidden features with action
@@ -232,7 +213,7 @@ def single_run(config: dict):
     random.seed(config["SEED"])
     np.random.seed(config["SEED"])
     key = jax.random.PRNGKey(config["SEED"])
-    key, network_key, actor_key, qf1_key, qf2_key = jax.random.split(key, 5)
+    key, actor_encoder_key, critic1_encoder_key, critic2_encoder_key, actor_key, qf1_key, qf2_key = jax.random.split(key, 7)
 
     # Environment
     env = make_env(
@@ -249,10 +230,8 @@ def single_run(config: dict):
     action_dim = action_space.shape[0]
     low = jnp.array(action_space.low)
     high = jnp.array(action_space.high)
-    # CleanRL action_scale = (high - low) / 2, used in the tanh log-prob
-    # correction (log-det-Jacobian). Confirmed by compare_sac_math.py as the
-    # first divergence from CleanRL.
     action_scale = (high - low) / 2.0
+    action_bias = (high + low) / 2.0
 
     # Vectorized environment wrappers
     @jax.jit
@@ -267,83 +246,232 @@ def single_run(config: dict):
         return next_obs, state, reward, next_done, info
 
     # Networks
-    NetworkClass = Network if config["PIXEL_BASED"] else MLP_Network
-    network = NetworkClass()
-    actor = Actor(action_dim=action_dim)
-    qf1 = SoftQNetwork(action_dim=action_dim)
-    qf2 = SoftQNetwork(action_dim=action_dim)
+    encoder_cls = CNNEncoder if config["PIXEL_BASED"] else MLPEncoder
 
+    critic1_encoder = encoder_cls()
+    critic2_encoder = encoder_cls()
+    actor_encoder = encoder_cls()
+
+    actor = Actor(action_dim=action_dim)
+
+    qf1 = SoftQNetwork()
+    qf2 = SoftQNetwork()
+    qf1_target = SoftQNetwork()
+    qf2_target = SoftQNetwork()
+
+    # Dummy inputs
     sample_obs = jnp.zeros(
         (1,) + obs_space.shape,
-        dtype=jnp.uint8
+        dtype=jnp.uint8 if config["PIXEL_BASED"] else jnp.float32,
     )
-    network_params = network.init(network_key, sample_obs)
-    hidden = network.apply(network_params, sample_obs)
-    actor_params = actor.init(actor_key, hidden)
-    # For Q networks, we need a dummy action to init
-    dummy_action = jnp.zeros((1, action_dim))
-    qf1_params = qf1.init(qf1_key, hidden, dummy_action)
-    qf2_params = qf2.init(qf2_key, hidden, dummy_action)
+    dummy_action = jnp.zeros(
+        (1, action_dim),
+        dtype=jnp.float32,
+    )
 
-    # Target networks (initialized as copies)
-    qf1_target_params = qf1_params
-    qf2_target_params = qf2_params
+    # Initialize Actor Encoder + Actor
+    actor_encoder_params = actor_encoder.init(
+        actor_encoder_key,
+        sample_obs,
+    )
+
+    actor_hidden = actor_encoder.apply(
+        actor_encoder_params,
+        sample_obs,
+    )
+
+    actor_params = actor.init(actor_key, actor_hidden)
+
+    # Initialize Critic 1 Encoder + Q1
+    critic1_encoder_params = critic1_encoder.init(
+        critic1_encoder_key,
+        sample_obs,
+    )
+
+    critic1_hidden = critic1_encoder.apply(
+        critic1_encoder_params,
+        sample_obs,
+    )
+
+    qf1_params = qf1.init(
+        qf1_key,
+        critic1_hidden,
+        dummy_action,
+    )
+
+    # Initialize Critic 2 Encoder + Q2
+    critic2_encoder_params = critic2_encoder.init(
+        critic2_encoder_key,
+        sample_obs,
+    )
+
+    critic2_hidden = critic2_encoder.apply(
+        critic2_encoder_params,
+        sample_obs,
+    )
+
+    qf2_params = qf2.init(
+        qf2_key,
+        critic2_hidden,
+        dummy_action,
+    )
 
     # Separate optimizers
     # Q-network optimizer
-    q_tx = optax.chain(
+    q_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=config["Q_LR"], eps=1e-5),
+        optax.adam(
+            learning_rate=config["Q_LR"],
+            eps=1e-8,
+        ),
     )
-    # Policy + network encoder optimizer
-    policy_tx = optax.chain(
+    # Actor optimizer
+    actor_optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=config["POLICY_LR"], eps=1e-5),
+        optax.adam(
+            learning_rate=config["POLICY_LR"],
+            eps=1e-8,
+        ),
     )
 
-    # We use separate TrainStates for Q and policy
+    # Pack encoder + network parameters
+    actor_train_params = {
+        "encoder": actor_encoder_params,
+        "actor": actor_params,
+    }
+
+    critic1_train_params = {
+        "encoder": critic1_encoder_params,
+        "qf": qf1_params,
+    }
+
+    critic2_train_params = {
+        "encoder": critic2_encoder_params,
+        "qf": qf2_params,
+    }
+    # Separate TrainStates for Q and Actor
     # Q networks share one optimizer
-    qf1_state = TrainState.create(apply_fn=None, params=qf1_params, tx=q_tx)
-    qf2_state = TrainState.create(apply_fn=None, params=qf2_params, tx=q_tx)
-    # Actor + network share another optimizer
-    actor_state = TrainState.create(apply_fn=None, params=actor_params, tx=policy_tx)
-    network_state = TrainState.create(apply_fn=None, params=network_params, tx=policy_tx)
+    # Critic 1 + Critic 1 Encoder
+    qf1_state = TrainState.create(
+        apply_fn=None,
+        params=critic1_train_params,
+        tx=q_optimizer,
+    )
+    # Critic 2 + Critic 2 Encoder
+    qf2_state = TrainState.create(
+        apply_fn=None,
+        params=critic2_train_params,
+        tx=q_optimizer,
+    )
+    # Actor use another optimizer
+    # Actor + Actor Encoder
+    actor_state = TrainState.create(
+        apply_fn=None,
+        params=actor_train_params,
+        tx=actor_optimizer,
+    )
+    # Target Critic parameters
+    qf1_target_params = {
+        "encoder": critic1_encoder_params,
+        "qf": qf1_params,
+    }
 
+    qf2_target_params = {
+        "encoder": critic2_encoder_params,
+        "qf": qf2_params,
+    }
     # Automatic entropy tuning
     if config["AUTOTUNE"]:
-        target_entropy = -action_dim
-        log_alpha = jnp.zeros(())
+        target_entropy = -float(np.prod(action_space.shape))
+
         alpha_state = TrainState.create(
             apply_fn=None,
-            params={"log_alpha": log_alpha},
-            tx=optax.adam(learning_rate=config.get("ALPHA_LR", config["POLICY_LR"]), eps=1e-5),
+            params={
+                "log_alpha": jnp.zeros(
+                    (1,),
+                    dtype=jnp.float32,
+                )
+            },
+            tx=optax.adam(
+                learning_rate=config.get(
+                    "ALPHA_LR",
+                    config["Q_LR"],
+                ),
+                eps=1e-5,
+            ),
         )
+        alpha = jnp.exp(alpha_state.params["log_alpha"])
     else:
-        alpha = config["ALPHA"]
+        alpha = jnp.asarray(
+            config["ALPHA"],
+            dtype=jnp.float32,
+        )
         alpha_state = None
+
+    # ---------- CALE action transformation helpers ----------
+    # Dopamine/CALE-compatible squashed Gaussian policy:
+    #   u ~ Normal(mean, std) -> y = tanh(u) -> action = action_bias + action_scale * y
+    # The final env action lies in [low, high] (e.g. [0,1] x [-pi,pi] x [0,1]).
+    # The log-probability is for the fully transformed env action and includes
+    # the tanh Jacobian (stable softplus form) plus the affine scaling Jacobian.
+
+    def gaussian_log_prob(x, mean, log_std):
+        """Log density of Normal(mean, exp(log_std)) evaluated at x (per-dim)."""
+        std = jnp.exp(log_std)
+        return -0.5 * (
+            ((x - mean) / (std + 1e-8)) ** 2
+            + 2.0 * jnp.log(std + 1e-8)
+            + jnp.log(2.0 * jnp.pi)
+        )
+
+    def tanh_affine_log_jacobian(u):
+        """log J = sum_i log( action_scale_i * (1 - tanh(u_i)^2 ) ).
+
+        Stable identity: log(1 - tanh(u)^2) = 2*(log(2) - u - softplus(-2u)).
+        """
+        tanh_corr = 2.0 * (jnp.log(2.0) - u - jax.nn.softplus(-2.0 * u))
+        return tanh_corr + jnp.log(action_scale)
+
+    def sample_env_action(mean, log_std, key):
+        """Reparameterized sample of the CALE-domain env action.
+
+        Returns:
+          action_env: env-domain action in [low, high]
+          log_prob:    log pi(a_env | s) with full tanh + affine Jacobian
+          pre_tanh:    the latent u (for diagnostics)
+        """
+        noise = jax.random.normal(key, shape=mean.shape)
+        u = mean + jnp.exp(log_std) * noise
+        action_tanh = jnp.tanh(u)
+        action_env = action_bias + action_scale * action_tanh
+        log_prob = gaussian_log_prob(u, mean, log_std).sum(axis=-1)
+        log_prob = log_prob - tanh_affine_log_jacobian(u).sum(axis=-1)
+        return action_env, log_prob, u
+
+    def deterministic_env_action(mean):
+        """Deterministic / evaluation action (tanh of mean + CALE affine)."""
+        return action_bias + action_scale * jnp.tanh(mean)
+
+    # Dopamine/CALE-compatible entropy target (-0.5 * action_dim).
+    target_entropy = -0.5 * action_dim
 
     # ---------- JIT functions ----------
 
     @jax.jit
-    def sample_action(network_params, actor_params, obs, key):
-        """Sample action from the policy (stochastic)."""
-        hidden = network.apply(network_params, obs)
-        mean, log_std = actor.apply(actor_params, hidden)
-        std = jnp.exp(log_std)
+    def sample_action(actor_state, obs, key):
+        """Sample a stochastic CALE-domain action from the current policy."""
+        hidden = actor_encoder.apply(actor_state.params["encoder"], obs)
+        mean, log_std = actor.apply(actor_state.params["actor"], hidden)
         key, subkey = jax.random.split(key)
-        z = mean + std * jax.random.normal(subkey, shape=mean.shape)
-        action = jnp.tanh(z)
-        action_rescaled = low + (action + 1.0) * (high - low) / 2.0
-        return action_rescaled, key
+        action_env, _, _ = sample_env_action(mean, log_std, subkey)
+        return action_env, key
 
     @jax.jit
-    def get_det_action(network_params, actor_params, obs):
-        """Deterministic action (mean, no noise) for evaluation."""
-        hidden = network.apply(network_params, obs)
-        mean, _ = actor.apply(actor_params, hidden)
-        action = jnp.tanh(mean)
-        action_rescaled = low + (action + 1.0) * (high - low) / 2.0
-        return action_rescaled
+    def get_det_action(actor_state, obs):
+        """Deterministic action (mean) for evaluation."""
+        hidden = actor_encoder.apply(actor_state.params["encoder"], obs)
+        mean, _ = actor.apply(actor_state.params["actor"], hidden)
+        return deterministic_env_action(mean)
 
     # ---------- SAC update functions ----------
 
@@ -358,100 +486,85 @@ def single_run(config: dict):
 
     @jax.jit
     def update_qf(
-        network_state, qf1_state, qf2_state,
+        qf1_state, qf2_state,
         qf1_target_params, qf2_target_params,
         actor_state, alpha, batch, key,
     ):
-        """Update Q-networks and shared encoder using MSE loss against target Q values."""
-        # next_hidden is stop-gradient (used for target computation only)
-        next_hidden = jax.lax.stop_gradient(network.apply(network_state.params, batch.next_obs))
+        """Update Critic 1 (encoder + Q1) and Critic 2 (encoder + Q2) independently.
 
-        # Compute target Q (with torch.no_grad() equivalent)
-        next_mean, next_log_std = actor.apply(actor_state.params, next_hidden)
-        next_std = jnp.exp(next_log_std)
+        Gradient isolation:
+          - qf1_state.params ({"encoder", "qf"}) receives gradients from Q1 loss only
+          - qf2_state.params ({"encoder", "qf"}) receives gradients from Q2 loss only
+          - the actor is used only for the target action / log-prob and is NOT
+            differentiated (target is stop_gradient; actor params are not argnums).
+        """
+        # ---- sample next action from the CURRENT actor (no target actor) ----
+        next_hidden = actor_encoder.apply(actor_state.params["encoder"], batch.next_obs)
+        next_mean, next_log_std = actor.apply(actor_state.params["actor"], next_hidden)
         key, subkey = jax.random.split(key)
-        next_z = next_mean + next_std * jax.random.normal(subkey, shape=next_mean.shape)
-        next_action = jnp.tanh(next_z)
+        next_action, next_log_prob, _ = sample_env_action(next_mean, next_log_std, subkey)
 
-        # Log-prob of the Gaussian before tanh
-        next_log_prob = -0.5 * (((next_z - next_mean) / (next_std + 1e-8)) ** 2
-                                 + 2 * jnp.log(next_std + 1e-8) + jnp.log(2 * jnp.pi))
-        next_log_prob = next_log_prob.sum(axis=-1)
-        # CleanRL tanh log-prob correction incl. action_scale (log-det-Jacobian)
-        next_log_prob -= jnp.log(action_scale * (1 - next_action**2) + 1e-6).sum(axis=-1)
-
-        # The Q network takes the raw tanh action (in [-1, 1])
-        qf1_next_target = qf1.apply(qf1_target_params, next_hidden, next_action).squeeze(-1)
-        qf2_next_target = qf2.apply(qf2_target_params, next_hidden, next_action).squeeze(-1)
+        # ---- target Q with target critics (each own target encoder + Q head) ----
+        # The target critics receive the CALE-domain next action.
+        z1_next = critic1_encoder.apply(qf1_target_params["encoder"], batch.next_obs)
+        z2_next = critic2_encoder.apply(qf2_target_params["encoder"], batch.next_obs)
+        qf1_next_target = qf1.apply(qf1_target_params["qf"], z1_next, next_action).squeeze(-1)
+        qf2_next_target = qf2.apply(qf2_target_params["qf"], z2_next, next_action).squeeze(-1)
         min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target) - alpha * next_log_prob
-        next_q_value = batch.reward + config["GAMMA"] * (1 - batch.done) * min_qf_next_target
+        next_q_value = batch.reward + config["GAMMA"] * (1.0 - batch.done) * min_qf_next_target
         next_q_value = jax.lax.stop_gradient(next_q_value)
 
-        # Current Q values
-        # The action in the buffer is already rescaled to [low, high], so we need to
-        # convert it back to [-1, 1] for the Q network.
-        # Guard against degenerate action spaces (high == low) and clip to avoid
-        # NaN from float32 rounding pushing the value slightly outside [-1, 1].
-        action_range = jnp.where(high > low, high - low, 1.0)
-        action_tanh = jnp.clip(
-            2.0 * (batch.action - low) / action_range - 1.0,
-            -0.999999,
-            0.999999,
-        )
-
-        # Compute loss and gradients for encoder + both Q-networks in a single pass.
-        # Gradient flows through the encoder from both Q-losses (like CleanRL where
-        # each Q-network updates its own encoder; here the encoder is shared).
-        def qf_loss_fn(params):
-            network_params, qf1_params, qf2_params = params
-            hidden = network.apply(network_params, batch.obs)
-            qf1_a = qf1.apply(qf1_params, hidden, action_tanh).squeeze(-1)
-            qf2_a = qf2.apply(qf2_params, hidden, action_tanh).squeeze(-1)
+        # ---- current Q values (critics receive the CALE-domain buffer action) ----
+        def critic_loss_fn(params1, params2):
+            z1 = critic1_encoder.apply(params1["encoder"], batch.obs)
+            z2 = critic2_encoder.apply(params2["encoder"], batch.obs)
+            qf1_a = qf1.apply(params1["qf"], z1, batch.action).squeeze(-1)
+            qf2_a = qf2.apply(params2["qf"], z2, batch.action).squeeze(-1)
             qf1_loss = ((qf1_a - next_q_value) ** 2).mean()
             qf2_loss = ((qf2_a - next_q_value) ** 2).mean()
             return qf1_loss + qf2_loss, (qf1_loss, qf2_loss, qf1_a.mean(), qf2_a.mean())
 
         (qf_loss, (qf1_loss, qf2_loss, qf1_values, qf2_values)), \
-            (network_grads, qf1_grads, qf2_grads) = jax.value_and_grad(qf_loss_fn, has_aux=True)(
-                (network_state.params, qf1_state.params, qf2_state.params)
-            )
+            (qf1_grads, qf2_grads) = jax.value_and_grad(
+                critic_loss_fn, argnums=(0, 1), has_aux=True
+            )(qf1_state.params, qf2_state.params)
 
-        new_network_state = network_state.apply_gradients(grads=network_grads)
         new_qf1_state = qf1_state.apply_gradients(grads=qf1_grads)
         new_qf2_state = qf2_state.apply_gradients(grads=qf2_grads)
 
-        return (new_qf1_state, new_qf2_state, new_network_state, qf_loss, qf1_loss, qf2_loss,
+        return (new_qf1_state, new_qf2_state, qf_loss, qf1_loss, qf2_loss,
                 qf1_values, qf2_values, next_q_value.mean(), key)
 
     @jax.jit
     def update_actor_and_alpha(
-        network_params, actor_state, qf1_state, qf2_state,
+        actor_state, qf1_state, qf2_state,
         alpha_state, alpha, batch, key,
     ):
-        """Update actor and alpha. The encoder is FROZEN (stop-gradient) here,
-        so it is only trained by the Q-loss in update_qf (standard practice for
-        shared-encoder SAC variants such as DrQ / SAC-AE)."""
-        # Freeze encoder representation for the policy update to avoid
-        # representation drift from two competing gradient sources.
-        hidden = jax.lax.stop_gradient(network.apply(network_params, batch.obs))
-        # Split the key so each actor update inside the delayed-policy loop
-        # uses fresh noise (previously the same key was reused across iterations).
+        """Update actor (encoder + MLP) and alpha.
+
+        Gradient isolation:
+          - actor_loss differentiates ONLY actor_state.params ({"encoder", "actor"})
+            -> the actor encoder IS trained by the policy objective.
+          - critic features are stop_gradient, so critic params are never updated
+            by the actor loss.
+        """
         key, noise_key = jax.random.split(key)
 
         def actor_loss_fn(actor_params):
-            mean, log_std = actor.apply(actor_params, hidden)
-            std = jnp.exp(log_std)
-            noise = jax.random.normal(noise_key, shape=mean.shape)
-            z = mean + std * noise
-            action = jnp.tanh(z)
-            log_prob = -0.5 * (((z - mean) / (std + 1e-8)) ** 2
-                                + 2 * jnp.log(std + 1e-8) + jnp.log(2 * jnp.pi))
-            log_prob = log_prob.sum(axis=-1)
-            # CleanRL tanh log-prob correction incl. action_scale (log-det-Jacobian)
-            log_prob -= jnp.log(action_scale * (1 - action**2) + 1e-6).sum(axis=-1)
+            # Gradients flow through the actor's own encoder into the actor MLP.
+            z_actor = actor_encoder.apply(actor_params["encoder"], batch.obs)
+            mean, log_std = actor.apply(actor_params["actor"], z_actor)
+            action_env, log_prob, _ = sample_env_action(mean, log_std, noise_key)
 
-            qf1_pi = qf1.apply(qf1_state.params, hidden, action).squeeze(-1)
-            qf2_pi = qf2.apply(qf2_state.params, hidden, action).squeeze(-1)
+            # Evaluate online critics with the CALE-domain action (fixed/stop-grad).
+            z1 = jax.lax.stop_gradient(
+                critic1_encoder.apply(qf1_state.params["encoder"], batch.obs)
+            )
+            z2 = jax.lax.stop_gradient(
+                critic2_encoder.apply(qf2_state.params["encoder"], batch.obs)
+            )
+            qf1_pi = qf1.apply(qf1_state.params["qf"], z1, action_env).squeeze(-1)
+            qf2_pi = qf2.apply(qf2_state.params["qf"], z2, action_env).squeeze(-1)
             min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
             actor_loss = (alpha * log_prob - min_qf_pi).mean()
             return actor_loss, log_prob
@@ -461,76 +574,13 @@ def single_run(config: dict):
         )
         new_actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-        # ---- TEMPORARY diagnostics (Stage 5 actor entropy failure isolation) ----
-        # Recompute sampled action / log_std / log_prob with current params
-        # for monitoring only (no gradient effect).
-        mean_diag, log_std_diag = actor.apply(new_actor_state.params, hidden)
-        std_diag = jnp.exp(log_std_diag)
-        key_diag, noise_key_diag = jax.random.split(key)
-        z_diag = mean_diag + std_diag * jax.random.normal(noise_key_diag, shape=mean_diag.shape)
-        action_diag = jnp.tanh(z_diag)
-
-        # Gaussian log prob (pre-tanh)
-        gauss_log_prob_diag = -0.5 * (((z_diag - mean_diag) / (std_diag + 1e-8)) ** 2
-                                      + 2 * jnp.log(std_diag + 1e-8) + jnp.log(2 * jnp.pi))
-        gauss_log_prob_diag = gauss_log_prob_diag.sum(axis=-1)
-        # Tanh correction (log-det-Jacobian) with action_scale
-        tanh_corr_diag = -jnp.log(action_scale * (1 - action_diag**2) + 1e-6).sum(axis=-1)
-        log_prob_diag = gauss_log_prob_diag + tanh_corr_diag
-        action_rescaled = low + (action_diag + 1.0) * (high - low) / 2.0
-
-        # Actor loss decomposition (entropy_term = alpha*log_prob, q_term = -min_q)
-        qf1_pi_diag = qf1.apply(qf1_state.params, hidden, action_diag).squeeze(-1)
-        qf2_pi_diag = qf2.apply(qf2_state.params, hidden, action_diag).squeeze(-1)
-        min_qf_pi_diag = jnp.minimum(qf1_pi_diag, qf2_pi_diag)
-        entropy_term_diag = alpha * log_prob_diag
-        q_term_diag = -min_qf_pi_diag
-
-        debug = {
-            # Actor distribution
-            "actor_mean_mean": mean_diag.mean(),
-            "actor_mean_min": mean_diag.min(),
-            "actor_mean_max": mean_diag.max(),
-            "log_std_mean": log_std_diag.mean(),
-            "log_std_min": log_std_diag.min(),
-            "log_std_max": log_std_diag.max(),
-            "std_mean": std_diag.mean(),
-            # Pre-tanh latent z
-            "z_mean": z_diag.mean(),
-            "z_std": z_diag.std(),
-            "z_min": z_diag.min(),
-            "z_max": z_diag.max(),
-            "fraction_abs_z_gt_5": (jnp.abs(z_diag) > 5.0).mean(),
-            "fraction_abs_z_gt_10": (jnp.abs(z_diag) > 10.0).mean(),
-            # Tanh saturation
-            "mean_abs_tanh": jnp.abs(action_diag).mean(),
-            "fraction_abs_tanh_gt_0p99": (jnp.abs(action_diag) > 0.99).mean(),
-            "fraction_abs_tanh_gt_0p999": (jnp.abs(action_diag) > 0.999).mean(),
-            # Log prob decomposition
-            "gaussian_log_prob_mean": gauss_log_prob_diag.mean(),
-            "tanh_correction_mean": tanh_corr_diag.mean(),
-            "log_prob_mean": log_prob_diag.mean(),
-            # Actor loss decomposition
-            "entropy_term_mean": entropy_term_diag.mean(),
-            "q_term_mean": q_term_diag.mean(),
-            # Alpha
-            "log_alpha": jnp.log(alpha),
-            "alpha": alpha,
-            # Existing extra diagnostics
-            "action_tanh_mean": action_diag.mean(),
-            "action_tanh_abs_mean": jnp.abs(action_diag).mean(),
-            "action_tanh_max": jnp.abs(action_diag).max(),
-            "entropy_gap": (log_prob_diag + target_entropy).mean(),
-            "env_action_mean_dim0": action_rescaled[..., 0].mean(),
-            "env_action_mean_dim1": action_rescaled[..., 1].mean(),
-            "env_action_mean_dim2": action_rescaled[..., 2].mean(),
-        }
-
-        # Alpha update (if autotune)
+        # Alpha update (if autotune), separate optimizer for log_alpha.
         if config["AUTOTUNE"]:
             def alpha_loss_fn(p):
                 alpha_val = jnp.exp(p["log_alpha"])
-                a_loss = -(p["log_alpha"] * (log_prob + target_entropy)).mean()
+                a_loss = -(
+                    p["log_alpha"] * (log_prob + target_entropy)
+                ).mean()
                 return a_loss, alpha_val
 
             (alpha_loss, new_alpha), a_grads = jax.value_and_grad(alpha_loss_fn, has_aux=True)(
@@ -543,7 +593,7 @@ def single_run(config: dict):
             new_alpha = alpha
 
         return (new_actor_state, new_alpha_state, new_alpha,
-                actor_loss, log_prob.mean(), alpha_loss, debug, key)
+                actor_loss, log_prob.mean(), alpha_loss, key)
 
     @jax.jit
     def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params, tau):
@@ -557,7 +607,7 @@ def single_run(config: dict):
         return new_qf1_target_params, new_qf2_target_params
 
     # ---------- Save and eval function ----------
-    def save_and_eval(iteration, network_state, actor_state, qf1_state, qf2_state):
+    def save_and_eval(iteration, actor_state, qf1_state, qf2_state):
         if config.get("SAVE_PATH") is not None:
             model_path = f'{config["SAVE_PATH"]}/{run_name}/{config["EXP_NAME"]}_{iteration}_{time.time()}.cleanrl_model'
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
@@ -567,7 +617,6 @@ def single_run(config: dict):
                         [
                             config,
                             [
-                                network_state.params,
                                 actor_state.params,
                                 qf1_state.params,
                                 qf2_state.params,
@@ -601,7 +650,6 @@ def single_run(config: dict):
                             [
                                 config,
                                 [
-                                    network_state.params,
                                     actor_state.params,
                                     qf1_state.params,
                                     qf2_state.params,
@@ -624,7 +672,7 @@ def single_run(config: dict):
                 ),
                 config["ENV_ID"],
                 eval_episodes=10,
-                Model=(Network, Actor, SoftQNetwork) if config["PIXEL_BASED"] else (MLP_Network, Actor, SoftQNetwork),
+                Model=(CNNEncoder, Actor, SoftQNetwork) if config["PIXEL_BASED"] else (MLPEncoder, Actor, SoftQNetwork),
                 seed=config["SEED"] + 42,
             )
             mean_return = np.mean(jax.device_get(episodic_returns))
@@ -810,7 +858,7 @@ def single_run(config: dict):
         for local_step in range(steps_per_iteration):
             # Sample action
             key, subkey = jax.random.split(key)
-            action, key = sample_action(network_state.params, actor_state.params, obs, subkey)
+            action, key = sample_action(actor_state, obs, subkey)
 
             # Step environment
             next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
@@ -863,10 +911,10 @@ def single_run(config: dict):
                     current_alpha = config["ALPHA"]
 
                 # Q update (every step after learning starts, like CleanRL)
-                # Encoder is also updated here (gradient from Q-loss).
-                (qf1_state, qf2_state, network_state, qf_loss, qf1_loss, qf2_loss,
+                # encoder_cls is also updated here (gradient from Q-loss).
+                (qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
                  qf1_values, qf2_values, next_q_values, key) = update_qf(
-                    network_state, qf1_state, qf2_state,
+                    qf1_state, qf2_state,
                     qf1_target_params, qf2_target_params,
                     actor_state, current_alpha, batch, key,
                 )
@@ -874,7 +922,7 @@ def single_run(config: dict):
                 # Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
                 # The loop matches CleanRL exactly: update the actor POLICY_FREQUENCY
                 # times on the same batch to compensate for the delayed update.
-                # The encoder is NOT updated here (see update_actor_and_alpha).
+                # The encoder_cls is NOT updated here (see update_actor_and_alpha).
                 if global_step % config["POLICY_FREQUENCY"] == 0:
                     for _ in range(config["POLICY_FREQUENCY"]):
                         (
@@ -884,10 +932,8 @@ def single_run(config: dict):
                             actor_loss,
                             log_prob_mean,
                             alpha_loss,
-                            debug,
                             key,
                         ) = update_actor_and_alpha(
-                            network_state.params,
                             actor_state,
                             qf1_state,
                             qf2_state,
@@ -900,38 +946,6 @@ def single_run(config: dict):
                     actor_loss = jnp.array(0.0)
                     log_prob_mean = jnp.array(0.0)
                     alpha_loss = jnp.array(0.0)
-                    debug = {
-                        "action_tanh_mean": jnp.array(0.0),
-                        "action_tanh_abs_mean": jnp.array(0.0),
-                        "action_tanh_max": jnp.array(0.0),
-                        "log_std_mean": jnp.array(0.0),
-                        "log_std_min": jnp.array(0.0),
-                        "log_std_max": jnp.array(0.0),
-                        "log_prob_mean": jnp.array(0.0),
-                        "entropy_gap": jnp.array(0.0),
-                        "alpha": current_alpha,
-                        "env_action_mean_dim0": jnp.array(0.0),
-                        "env_action_mean_dim1": jnp.array(0.0),
-                        "env_action_mean_dim2": jnp.array(0.0),
-                        "actor_mean_mean": jnp.array(0.0),
-                        "actor_mean_min": jnp.array(0.0),
-                        "actor_mean_max": jnp.array(0.0),
-                        "std_mean": jnp.array(0.0),
-                        "z_mean": jnp.array(0.0),
-                        "z_std": jnp.array(0.0),
-                        "z_min": jnp.array(0.0),
-                        "z_max": jnp.array(0.0),
-                        "fraction_abs_z_gt_5": jnp.array(0.0),
-                        "fraction_abs_z_gt_10": jnp.array(0.0),
-                        "mean_abs_tanh": jnp.array(0.0),
-                        "fraction_abs_tanh_gt_0p99": jnp.array(0.0),
-                        "fraction_abs_tanh_gt_0p999": jnp.array(0.0),
-                        "gaussian_log_prob_mean": jnp.array(0.0),
-                        "tanh_correction_mean": jnp.array(0.0),
-                        "entropy_term_mean": jnp.array(0.0),
-                        "q_term_mean": jnp.array(0.0),
-                        "log_alpha": jnp.array(0.0),
-                    }
 
                 # Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
@@ -967,48 +981,16 @@ def single_run(config: dict):
                 "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
-                # ---- TEMPORARY diagnostics (A/B validation) ----
-                # ---- TEMPORARY diagnostics (Stage 5 actor entropy) ----
-                "debug/action_tanh_mean": debug["action_tanh_mean"],
-                "debug/action_tanh_abs_mean": debug["action_tanh_abs_mean"],
-                "debug/action_tanh_max": debug["action_tanh_max"],
-                "debug/actor_mean_mean": debug["actor_mean_mean"],
-                "debug/actor_mean_min": debug["actor_mean_min"],
-                "debug/actor_mean_max": debug["actor_mean_max"],
-                "debug/log_std_mean": debug["log_std_mean"],
-                "debug/log_std_min": debug["log_std_min"],
-                "debug/log_std_max": debug["log_std_max"],
-                "debug/std_mean": debug["std_mean"],
-                "debug/z_mean": debug["z_mean"],
-                "debug/z_std": debug["z_std"],
-                "debug/z_min": debug["z_min"],
-                "debug/z_max": debug["z_max"],
-                "debug/fraction_abs_z_gt_5": debug["fraction_abs_z_gt_5"],
-                "debug/fraction_abs_z_gt_10": debug["fraction_abs_z_gt_10"],
-                "debug/mean_abs_tanh": debug["mean_abs_tanh"],
-                "debug/fraction_abs_tanh_gt_0p99": debug["fraction_abs_tanh_gt_0p99"],
-                "debug/fraction_abs_tanh_gt_0p999": debug["fraction_abs_tanh_gt_0p999"],
-                "debug/gaussian_log_prob_mean": debug["gaussian_log_prob_mean"],
-                "debug/tanh_correction_mean": debug["tanh_correction_mean"],
-                "debug/log_prob_mean": debug["log_prob_mean"],
-                "debug/entropy_term_mean": debug["entropy_term_mean"],
-                "debug/q_term_mean": debug["q_term_mean"],
-                "debug/log_alpha": debug["log_alpha"],
-                "debug/entropy_gap": debug["entropy_gap"],
-                "debug/alpha": debug["alpha"],
-                "debug/env_action_mean_dim0": debug["env_action_mean_dim0"],
-                "debug/env_action_mean_dim1": debug["env_action_mean_dim1"],
-                "debug/env_action_mean_dim2": debug["env_action_mean_dim2"],
             })
             wandb.log(metrics, step=global_step)
 
         # Evaluation
         if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:
-            save_and_eval(iteration, network_state, actor_state, qf1_state, qf2_state)
+            save_and_eval(iteration, actor_state, qf1_state, qf2_state)
 
     # Final eval
     print("Evaluating final model ...")
-    metrics = save_and_eval(iteration + 1, network_state, actor_state, qf1_state, qf2_state)
+    metrics = save_and_eval(iteration + 1, actor_state, qf1_state, qf2_state)
     wandb.finish()
     print("Training finished.")
     train_elapsed = time.time() - start_time
