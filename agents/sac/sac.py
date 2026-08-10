@@ -337,14 +337,14 @@ def single_run(config: dict):
     # Separate optimizers
     # Q-network optimizer
     q_optimizer = optax.adam(
-            learning_rate=config["Q_LR"],
-            eps=1e-8,
-    ),
+        learning_rate=config["Q_LR"],
+        eps=1e-8,
+    )
     # Actor optimizer
     actor_optimizer = optax.adam(
-            learning_rate=config["POLICY_LR"],
-            eps=1e-8,
-    ),
+        learning_rate=config["POLICY_LR"],
+        eps=1e-8,
+    )
 
 
     # Pack encoder + network parameters
