@@ -169,7 +169,7 @@ class MLPEncoder(nn.Module):
 class Actor(nn.Module):
     """Gaussian policy for continuous actions."""
     action_dim: int
-    log_std_min: float = -5.0   # CleanRL default
+    log_std_min: float = -1.0   # CleanRL default
     log_std_max: float = 2.0    # CleanRL default
 
     @nn.compact
@@ -336,16 +336,21 @@ def single_run(config: dict):
 
     # Separate optimizers
     # Q-network optimizer
-    q_optimizer = optax.adam(
-        learning_rate=config["Q_LR"],
-        eps=1e-8,
+    q_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(
+            learning_rate=config["Q_LR"],
+            eps=1e-8,
+        ),
     )
     # Actor optimizer
-    actor_optimizer = optax.adam(
-        learning_rate=config["POLICY_LR"],
-        eps=1e-8,
+    actor_optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(
+            learning_rate=config["POLICY_LR"],
+            eps=1e-8,
+        ),
     )
-
 
     # Pack encoder + network parameters
     actor_train_params = {
