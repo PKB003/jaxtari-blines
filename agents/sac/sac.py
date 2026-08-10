@@ -169,7 +169,7 @@ class MLPEncoder(nn.Module):
 class Actor(nn.Module):
     """Gaussian policy for continuous actions."""
     action_dim: int
-    log_std_min: float = -1.0   # CleanRL default
+    log_std_min: float = -5.0   # CleanRL default
     log_std_max: float = 2.0    # CleanRL default
 
     @nn.compact
@@ -415,7 +415,7 @@ def single_run(config: dict):
                     "ALPHA_LR",
                     config["Q_LR"],
                 ),
-                eps=1e-5,
+                eps=1e-8,
             ),
         )
         alpha = jnp.exp(alpha_state.params["log_alpha"])
@@ -555,63 +555,172 @@ def single_run(config: dict):
 
     @jax.jit
     def update_actor_and_alpha(
-        actor_state, qf1_state, qf2_state,
-        alpha_state, alpha, batch, key,
+            actor_state,
+            qf1_state,
+            qf2_state,
+            alpha_state,
+            alpha,
+            batch,
+            key,
     ):
-        """Update actor (encoder + MLP) and alpha.
+        # ============================================================
+        # 1. ACTOR UPDATE
+        # ============================================================
 
-        Gradient isolation:
-          - actor_loss differentiates ONLY actor_state.params ({"encoder", "actor"})
-            -> the actor encoder IS trained by the policy objective.
-          - critic features are stop_gradient, so critic params are never updated
-            by the actor loss.
-        """
-        key, noise_key = jax.random.split(key)
+        key, actor_key = jax.random.split(key)
 
         def actor_loss_fn(actor_params):
-            # Gradients flow through the actor's own encoder into the actor MLP.
-            z_actor = actor_encoder.apply(actor_params["encoder"], batch.obs)
-            mean, log_std = actor.apply(actor_params["actor"], z_actor)
-            action_env, log_prob, _ = sample_env_action(mean, log_std, noise_key)
+            z_actor = actor_encoder.apply(
+                actor_params["encoder"],
+                batch.obs,
+            )
 
-            # Evaluate online critics with the CALE-domain action (fixed/stop-grad).
+            mean, log_std = actor.apply(
+                actor_params["actor"],
+                z_actor,
+            )
+
+            action_env, log_prob, _ = sample_env_action(
+                mean,
+                log_std,
+                actor_key,
+            )
+
+            # Critic encoders/features are treated as constants
             z1 = jax.lax.stop_gradient(
-                critic1_encoder.apply(qf1_state.params["encoder"], batch.obs)
+                critic1_encoder.apply(
+                    qf1_state.params["encoder"],
+                    batch.obs,
+                )
             )
+
             z2 = jax.lax.stop_gradient(
-                critic2_encoder.apply(qf2_state.params["encoder"], batch.obs)
+                critic2_encoder.apply(
+                    qf2_state.params["encoder"],
+                    batch.obs,
+                )
             )
-            qf1_pi = qf1.apply(qf1_state.params["qf"], z1, action_env).squeeze(-1)
-            qf2_pi = qf2.apply(qf2_state.params["qf"], z2, action_env).squeeze(-1)
-            min_qf_pi = jnp.minimum(qf1_pi, qf2_pi)
-            actor_loss = (alpha * log_prob - min_qf_pi).mean()
-            return actor_loss, log_prob
 
-        (actor_loss, log_prob), actor_grads = jax.value_and_grad(actor_loss_fn, has_aux=True)(
-            actor_state.params
+            qf1_pi = qf1.apply(
+                qf1_state.params["qf"],
+                z1,
+                action_env,
+            ).squeeze(-1)
+
+            qf2_pi = qf2.apply(
+                qf2_state.params["qf"],
+                z2,
+                action_env,
+            ).squeeze(-1)
+
+            min_qf_pi = jnp.minimum(
+                qf1_pi,
+                qf2_pi,
+            )
+
+            # Alpha is constant from actor's perspective
+            alpha_for_actor = jax.lax.stop_gradient(alpha)
+
+            actor_loss = (
+                    alpha_for_actor * log_prob
+                    - min_qf_pi
+            ).mean()
+
+            return actor_loss
+
+        actor_loss, actor_grads = jax.value_and_grad(
+            actor_loss_fn
+        )(actor_state.params)
+
+        # IMPORTANT:
+        # actor parameters are updated BEFORE alpha update
+        new_actor_state = actor_state.apply_gradients(
+            grads=actor_grads
         )
-        new_actor_state = actor_state.apply_gradients(grads=actor_grads)
 
-        # Alpha update (if autotune), separate optimizer for log_alpha.
+        # ============================================================
+        # 2. ALPHA UPDATE
+        # ============================================================
+
         if config["AUTOTUNE"]:
-            def alpha_loss_fn(p):
-                alpha_val = jnp.exp(p["log_alpha"])
-                a_loss = -(
-                    p["log_alpha"] * (log_prob + target_entropy)
-                ).mean()
-                return a_loss, alpha_val
 
-            (alpha_loss, new_alpha), a_grads = jax.value_and_grad(alpha_loss_fn, has_aux=True)(
-                alpha_state.params
+            # New random key, because CleanRL calls actor.get_action()
+            # again after the actor optimizer step.
+            key, alpha_key = jax.random.split(key)
+
+            def get_log_prob(actor_params):
+                z_actor = actor_encoder.apply(
+                    actor_params["encoder"],
+                    batch.obs,
+                )
+
+                mean, log_std = actor.apply(
+                    actor_params["actor"],
+                    z_actor,
+                )
+
+                _, log_prob, _ = sample_env_action(
+                    mean,
+                    log_std,
+                    alpha_key,
+                )
+
+                return log_prob
+
+            # IMPORTANT:
+            # use UPDATED actor parameters
+            log_prob_alpha = get_log_prob(
+                new_actor_state.params
             )
-            new_alpha_state = alpha_state.apply_gradients(grads=a_grads)
-        else:
-            new_alpha_state = alpha_state
-            alpha_loss = jnp.array(0.0)
-            new_alpha = alpha
 
-        return (new_actor_state, new_alpha_state, new_alpha,
-                actor_loss, log_prob.mean(), alpha_loss, key)
+            # Equivalent to torch.no_grad()
+            log_prob_alpha = jax.lax.stop_gradient(
+                log_prob_alpha
+            )
+
+            def alpha_loss_fn(alpha_params):
+                log_alpha = alpha_params["log_alpha"]
+
+                alpha_loss = -(
+                        log_alpha *
+                        (log_prob_alpha + target_entropy)
+                ).mean()
+
+                return alpha_loss
+
+            alpha_loss, alpha_grads = jax.value_and_grad(
+                alpha_loss_fn
+            )(alpha_state.params)
+
+            # Update log_alpha
+            new_alpha_state = alpha_state.apply_gradients(
+                grads=alpha_grads
+            )
+
+            # IMPORTANT:
+            # recompute alpha AFTER optimizer update
+            new_alpha = jnp.exp(
+                new_alpha_state.params["log_alpha"]
+            )
+
+            log_prob_mean = log_prob_alpha.mean()
+
+        else:
+
+            new_alpha_state = alpha_state
+            new_alpha = alpha
+            alpha_loss = jnp.array(0.0)
+            log_prob_mean = jnp.array(0.0)
+
+        return (
+            new_actor_state,
+            new_alpha_state,
+            new_alpha,
+            actor_loss,
+            log_prob_mean,
+            alpha_loss,
+            key,
+        )
 
     @jax.jit
     def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params, tau):
