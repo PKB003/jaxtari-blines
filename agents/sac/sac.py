@@ -470,8 +470,13 @@ def single_run(config: dict):
         """Deterministic / evaluation action (tanh of mean + CALE affine)."""
         return action_bias + action_scale * jnp.tanh(mean)
 
-    # Dopamine/CALE-compatible entropy target (-0.5 * action_dim).
-    target_entropy = -0.5 * action_dim
+    # CleanRL-compatible entropy target (-action_dim).
+    # NOTE: must be -action_dim (= -3 here), NOT -0.5*action_dim. The initial
+    # policy has log_prob ~ +2.0 (std ~ 0.22); with target_entropy=-1.5 we get
+    # log_prob+target_entropy > 0, which drives alpha -> 0 and collapses the
+    # policy. With target_entropy=-action_dim, log_prob+target_entropy < 0, so
+    # alpha rises and entropy pressure widens the policy -> proper exploration.
+    target_entropy = -action_dim
 
     # ---------- JIT functions ----------
 
