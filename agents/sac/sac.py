@@ -519,6 +519,10 @@ def single_run(config: dict):
         flat, _ = jax.flatten_util.ravel_pytree(pytrees)
         return jnp.sqrt(jnp.sum(flat ** 2))
 
+    def _to_float(x):
+        """Safely convert a (possibly 0-d or 1-d) jax/numpy array to a python float."""
+        return float(np.asarray(x).reshape(-1)[0])
+
     def discrete_action_id(action, tau=0.5):
         """Map CALE continuous (r, theta, fire) to a discrete id (0..17).
 
@@ -1105,7 +1109,8 @@ def single_run(config: dict):
                 )
                 # Get current alpha
                 if config["AUTOTUNE"]:
-                    current_alpha = jnp.exp(alpha_state.params["log_alpha"])
+                    # alpha is stored as shape (1,); squeeze to scalar so float() works
+                    current_alpha = jnp.exp(alpha_state.params["log_alpha"]).squeeze()
                 else:
                     current_alpha = config["ALPHA"]
 
@@ -1214,13 +1219,13 @@ def single_run(config: dict):
 
             # DEBUG: compact per-iteration terminal line.
             print(
-                f"[ITER {iteration:3d}] step={global_step:6d} ret={float(avg_return):6.1f} "
-                f"len={float(avg_length):5.0f} alpha={float(current_alpha):.4f} "
-                f"logp={float(log_prob_mean):6.2f} q1={float(qf1_values):7.2f} "
-                f"q2={float(qf2_values):7.2f} qf_loss={float(qf_loss):.4f} "
-                f"act_loss={float(actor_loss):6.3f} "
-                f"|g_act|={float(actor_grad_norm):6.2f} |g_enc_act|={float(actor_enc_grad_norm):6.2f} "
-                f"|g_q1|={float(qf1_grad_norm):6.2f} |g_q2|={float(qf2_grad_norm):6.2f} "
+                f"[ITER {iteration:3d}] step={global_step:6d} ret={_to_float(avg_return):6.1f} "
+                f"len={_to_float(avg_length):5.0f} alpha={_to_float(current_alpha):.4f} "
+                f"logp={_to_float(log_prob_mean):6.2f} q1={_to_float(qf1_values):7.2f} "
+                f"q2={_to_float(qf2_values):7.2f} qf_loss={_to_float(qf_loss):.4f} "
+                f"act_loss={_to_float(actor_loss):6.3f} "
+                f"|g_act|={_to_float(actor_grad_norm):6.2f} |g_enc_act|={_to_float(actor_enc_grad_norm):6.2f} "
+                f"|g_q1|={_to_float(qf1_grad_norm):6.2f} |g_q2|={_to_float(qf2_grad_norm):6.2f} "
                 f"uniq_disc={unique_discrete}/18 frac_cont_uniq={frac_cont_unique:.3f} "
                 f"|a|_mean={action_abs_mean:.3f}"
             )
