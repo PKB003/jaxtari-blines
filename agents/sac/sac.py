@@ -8,6 +8,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.8")
 import random
 import subprocess
 import time
+from collections import deque
 from functools import partial
 from typing import Optional
 
@@ -250,6 +251,11 @@ def single_run(config: dict):
     high = jnp.array(action_space.high)
     action_scale = (high - low) / 2.0
     action_bias = (high + low) / 2.0
+    print(f"[ENV] action_dim={action_dim}")
+    print(f"[ENV] action_low={action_space.low}")
+    print(f"[ENV] action_high={action_space.high}")
+    print(f"[ENV] action_scale={action_scale.tolist()}")
+    print(f"[ENV] action_bias={action_bias.tolist()}")
 
     # Vectorized environment wrappers
     @jax.jit
@@ -333,6 +339,12 @@ def single_run(config: dict):
         critic2_hidden,
         dummy_action,
     )
+
+    print(f"[NET] actor_encoder hidden shape: {tuple(actor_hidden.shape)} (feature dim should end in 512)")
+    print(f"[NET] critic1_encoder hidden shape: {tuple(critic1_hidden.shape)}")
+    print(f"[NET] critic2_encoder hidden shape: {tuple(critic2_hidden.shape)}")
+    print(f"[NET] actor mean/log_std output dim: {action_dim}")
+    print(f"[NET] Q input dim (hidden + action): {critic1_hidden.shape[-1] + action_dim}")
 
     # Separate optimizers
     # Q-network optimizer
@@ -502,6 +514,29 @@ def single_run(config: dict):
             return x.squeeze(1)
         return x
 
+    def _g_norm(*pytrees):
+        """Global L2 norm of flattened gradient pytrees (for debug logging)."""
+        flat, _ = jax.flatten_util.ravel_pytree(pytrees)
+        return jnp.sqrt(jnp.sum(flat ** 2))
+
+    def discrete_action_id(action, tau=0.5):
+        """Map CALE continuous (r, theta, fire) to a discrete id (0..17).
+
+        Mirrors the ContinuousActionWrapper tau discretisation; used to measure
+        action diversity of the current policy from real env-step actions.
+        """
+        if action.shape[-1] != 3:
+            return jnp.zeros(action.shape[:-1], dtype=jnp.int32)
+        r = action[..., 0]
+        theta = action[..., 1]
+        fire = action[..., 2]
+        x = r * jnp.cos(theta)
+        y = r * jnp.sin(theta)
+        x_idx = (x > tau).astype(jnp.int32) - (x < -tau).astype(jnp.int32) + 1
+        y_idx = (y > tau).astype(jnp.int32) - (y < -tau).astype(jnp.int32) + 1
+        fire_idx = (fire > tau).astype(jnp.int32)
+        return x_idx * 6 + y_idx * 2 + fire_idx
+
     @jax.jit
     def update_qf(
         qf1_state, qf2_state,
@@ -550,8 +585,20 @@ def single_run(config: dict):
         new_qf1_state = qf1_state.apply_gradients(grads=qf1_grads)
         new_qf2_state = qf2_state.apply_gradients(grads=qf2_grads)
 
+        # ---- DEBUG: gradient norms (per encoder / per Q head) ----
+        qf1_grad_norm = _g_norm(qf1_grads)
+        qf2_grad_norm = _g_norm(qf2_grads)
+        qf1_enc_grad_norm = _g_norm(qf1_grads["encoder"])
+        qf1_q_grad_norm = _g_norm(qf1_grads["qf"])
+        qf2_enc_grad_norm = _g_norm(qf2_grads["encoder"])
+        qf2_q_grad_norm = _g_norm(qf2_grads["qf"])
+
         return (new_qf1_state, new_qf2_state, qf_loss, qf1_loss, qf2_loss,
-                qf1_values, qf2_values, next_q_value.mean(), key)
+                qf1_values, qf2_values, next_q_value.mean(),
+                qf1_grad_norm, qf2_grad_norm,
+                qf1_enc_grad_norm, qf1_q_grad_norm,
+                qf2_enc_grad_norm, qf2_q_grad_norm,
+                key)
 
     @jax.jit
     def update_actor_and_alpha(
@@ -712,6 +759,16 @@ def single_run(config: dict):
             alpha_loss = jnp.array(0.0)
             log_prob_mean = jnp.array(0.0)
 
+        # ---- DEBUG: actor / alpha gradient norms ----
+        actor_grad_norm = _g_norm(actor_grads)
+        actor_enc_grad_norm = _g_norm(actor_grads["encoder"])
+        actor_mlp_grad_norm = _g_norm(actor_grads["actor"])
+
+        if config["AUTOTUNE"]:
+            alpha_grad_norm = _g_norm(alpha_grads)
+        else:
+            alpha_grad_norm = jnp.array(0.0)
+
         return (
             new_actor_state,
             new_alpha_state,
@@ -719,6 +776,10 @@ def single_run(config: dict):
             actor_loss,
             log_prob_mean,
             alpha_loss,
+            actor_grad_norm,
+            actor_enc_grad_norm,
+            actor_mlp_grad_norm,
+            alpha_grad_norm,
             key,
         )
 
@@ -979,6 +1040,9 @@ def single_run(config: dict):
     steps_per_iteration = config["SCAN_STEPS"]
     num_iterations = total_timesteps // (num_envs * steps_per_iteration) + 1
 
+    # DEBUG: track recent env-step actions to measure policy diversity.
+    recent_actions = deque(maxlen=200)
+
     for iteration in range(num_iterations):
         rtpt.step()
 
@@ -987,6 +1051,9 @@ def single_run(config: dict):
             # Sample action
             key, subkey = jax.random.split(key)
             action, key = sample_action(actor_state, obs, subkey)
+
+            # DEBUG: record env-step actions (after action.squeeze, shape (3,))
+            recent_actions.append(np.asarray(action.squeeze()))
 
             # Step environment
             next_obs, env_state, reward, next_done, info = vmap_step(env_state, action)
@@ -1043,18 +1110,18 @@ def single_run(config: dict):
                     current_alpha = config["ALPHA"]
 
                 # Q update (every step after learning starts, like CleanRL)
-                # encoder_cls is also updated here (gradient from Q-loss).
                 (qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
-                 qf1_values, qf2_values, next_q_values, key) = update_qf(
+                 qf1_values, qf2_values, next_q_values,
+                 qf1_grad_norm, qf2_grad_norm,
+                 qf1_enc_grad_norm, qf1_q_grad_norm,
+                 qf2_enc_grad_norm, qf2_q_grad_norm,
+                 key) = update_qf(
                     qf1_state, qf2_state,
                     qf1_target_params, qf2_target_params,
                     actor_state, current_alpha, batch, key,
                 )
 
                 # Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
-                # The loop matches CleanRL exactly: update the actor POLICY_FREQUENCY
-                # times on the same batch to compensate for the delayed update.
-                # The encoder_cls is NOT updated here (see update_actor_and_alpha).
                 if global_step % config["POLICY_FREQUENCY"] == 0:
                     for _ in range(config["POLICY_FREQUENCY"]):
                         (
@@ -1064,6 +1131,10 @@ def single_run(config: dict):
                             actor_loss,
                             log_prob_mean,
                             alpha_loss,
+                            actor_grad_norm,
+                            actor_enc_grad_norm,
+                            actor_mlp_grad_norm,
+                            alpha_grad_norm,
                             key,
                         ) = update_actor_and_alpha(
                             actor_state,
@@ -1078,6 +1149,10 @@ def single_run(config: dict):
                     actor_loss = jnp.array(0.0)
                     log_prob_mean = jnp.array(0.0)
                     alpha_loss = jnp.array(0.0)
+                    actor_grad_norm = jnp.array(0.0)
+                    actor_enc_grad_norm = jnp.array(0.0)
+                    actor_mlp_grad_norm = jnp.array(0.0)
+                    alpha_grad_norm = jnp.array(0.0)
 
                 # Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
@@ -1094,6 +1169,13 @@ def single_run(config: dict):
         if iteration % 1 == 0:
             avg_return = info["returned_episode_returns"].mean() if "returned_episode_returns" in info else 0.0
             avg_length = info["returned_episode_lengths"].mean() if "returned_episode_lengths" in info else 0.0
+
+            # DEBUG: action diversity over the last 200 env-step actions.
+            recent_as = np.stack([np.asarray(a) for a in recent_actions]) if recent_actions else np.zeros((1, action_dim))
+            recent_ids = np.asarray(jax.device_get(discrete_action_id(jnp.array(recent_as, dtype=jnp.float32))))
+            unique_discrete = int(np.unique(recent_ids).size)
+            frac_cont_unique = float(len(np.unique(np.round(recent_as, 4), axis=0))) / max(len(recent_as), 1)
+            action_abs_mean = float(np.abs(recent_as).mean()) if len(recent_as) else 0.0
 
             # Gather all device tensors in a single host transfer to avoid
             # repeated device->host copies (each float() triggers one).
@@ -1113,8 +1195,35 @@ def single_run(config: dict):
                 "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
+                # ---- DEBUG metrics ----
+                "debug/unique_discrete_actions": unique_discrete,
+                "debug/fraction_cont_unique": frac_cont_unique,
+                "debug/action_abs_mean": action_abs_mean,
+                "debug/actor_grad_norm": actor_grad_norm,
+                "debug/actor_enc_grad_norm": actor_enc_grad_norm,
+                "debug/actor_mlp_grad_norm": actor_mlp_grad_norm,
+                "debug/alpha_grad_norm": alpha_grad_norm,
+                "debug/qf1_grad_norm": qf1_grad_norm,
+                "debug/qf2_grad_norm": qf2_grad_norm,
+                "debug/qf1_enc_grad_norm": qf1_enc_grad_norm,
+                "debug/qf1_q_grad_norm": qf1_q_grad_norm,
+                "debug/qf2_enc_grad_norm": qf2_enc_grad_norm,
+                "debug/qf2_q_grad_norm": qf2_q_grad_norm,
             })
             wandb.log(metrics, step=global_step)
+
+            # DEBUG: compact per-iteration terminal line.
+            print(
+                f"[ITER {iteration:3d}] step={global_step:6d} ret={float(avg_return):6.1f} "
+                f"len={float(avg_length):5.0f} alpha={float(current_alpha):.4f} "
+                f"logp={float(log_prob_mean):6.2f} q1={float(qf1_values):7.2f} "
+                f"q2={float(qf2_values):7.2f} qf_loss={float(qf_loss):.4f} "
+                f"act_loss={float(actor_loss):6.3f} "
+                f"|g_act|={float(actor_grad_norm):6.2f} |g_enc_act|={float(actor_enc_grad_norm):6.2f} "
+                f"|g_q1|={float(qf1_grad_norm):6.2f} |g_q2|={float(qf2_grad_norm):6.2f} "
+                f"uniq_disc={unique_discrete}/18 frac_cont_uniq={frac_cont_unique:.3f} "
+                f"|a|_mean={action_abs_mean:.3f}"
+            )
 
         # Evaluation
         if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:
