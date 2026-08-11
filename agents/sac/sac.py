@@ -731,9 +731,10 @@ def single_run(config: dict):
 
             def alpha_loss_fn(alpha_params):
                 log_alpha = alpha_params["log_alpha"]
+                alpha_value = jnp.exp(log_alpha)
 
                 alpha_loss = -(
-                        log_alpha *
+                        alpha_value *
                         (log_prob_alpha + target_entropy)
                 ).mean()
 
@@ -1182,6 +1183,59 @@ def single_run(config: dict):
             frac_cont_unique = float(len(np.unique(np.round(recent_as, 4), axis=0))) / max(len(recent_as), 1)
             action_abs_mean = float(np.abs(recent_as).mean()) if len(recent_as) else 0.0
 
+            # DEBUG: verify the full action pipeline
+            #   actor output -> [0,1]x[-pi,pi]x[0,1] -> replay buffer -> critic.
+            # The env-step actions in `recent_actions` are the actor's CALE-domain
+            # samples (identical transform to next_action inside update_qf), so we
+            # print them here per-iteration instead of inside the jitted hot loop
+            # (which would spam ~150 lines/sec).
+            actor_a = recent_as
+            print(
+                "actor action min:",
+                actor_a.min(axis=0),
+                "max:",
+                actor_a.max(axis=0),
+                "mean:",
+                actor_a.mean(axis=0),
+            )
+
+            # Replay-buffer action: exactly the tensor the critics receive.
+            buf_a = np.asarray(jax.device_get(batch.action))
+            print(
+                "buffer action min:",
+                buf_a.min(axis=0),
+                "max:",
+                buf_a.max(axis=0),
+                "mean:",
+                buf_a.mean(axis=0),
+            )
+
+            # Q-sensitivity of Critic 1 to the action input: do extreme CALE-domain
+            # actions give distinct Q values, and is |dQ/da| meaningful? If
+            # mean|dQ/da| ~ 0, the critic ignores the action -> actor gets no policy
+            # gradient -> frozen policy (exactly what the current log suggests:
+            # |g_act| collapses to ~0.01 while Q drifts flat negative).
+            obs0 = batch.obs[:1]
+            mz = critic1_encoder.apply(qf1_state.params["encoder"], obs0)
+            a1 = jnp.array([[0.0, -jnp.pi, 0.0]], dtype=jnp.float32)
+            a2 = jnp.array([[0.5, 0.0, 0.5]], dtype=jnp.float32)
+            a3 = jnp.array([[1.0, jnp.pi, 1.0]], dtype=jnp.float32)
+            qv1 = qf1.apply(qf1_state.params["qf"], mz, a1).squeeze()
+            qv2 = qf1.apply(qf1_state.params["qf"], mz, a2).squeeze()
+            qv3 = qf1.apply(qf1_state.params["qf"], mz, a3).squeeze()
+            q_range_corners = _to_float(qv3) - _to_float(qv1)
+            print("Q(a1) =", _to_float(qv1), " Q(a2) =", _to_float(qv2), " Q(a3) =", _to_float(qv3))
+
+            def q_of_action(action):
+                z_c = critic1_encoder.apply(qf1_state.params["encoder"], obs0)
+                return qf1.apply(qf1_state.params["qf"], z_c, action).sum()
+
+            dq_da = jax.grad(q_of_action)(a2)
+            dq_da_np = np.asarray(jax.device_get(dq_da))
+            mean_abs_dqda = _to_float(jnp.mean(jnp.abs(dq_da)))
+            print("dQ/da =", dq_da_np)
+            print("mean |dQ/da| =", mean_abs_dqda)
+
             # Gather all device tensors in a single host transfer to avoid
             # repeated device->host copies (each float() triggers one).
             metrics = jax.device_get({
@@ -1204,6 +1258,8 @@ def single_run(config: dict):
                 "debug/unique_discrete_actions": unique_discrete,
                 "debug/fraction_cont_unique": frac_cont_unique,
                 "debug/action_abs_mean": action_abs_mean,
+                "debug/q_range_corners": q_range_corners,
+                "debug/mean_abs_dqda": mean_abs_dqda,
                 "debug/actor_grad_norm": actor_grad_norm,
                 "debug/actor_enc_grad_norm": actor_enc_grad_norm,
                 "debug/actor_mlp_grad_norm": actor_mlp_grad_norm,
@@ -1227,7 +1283,7 @@ def single_run(config: dict):
                 f"|g_act|={_to_float(actor_grad_norm):6.2f} |g_enc_act|={_to_float(actor_enc_grad_norm):6.2f} "
                 f"|g_q1|={_to_float(qf1_grad_norm):6.2f} |g_q2|={_to_float(qf2_grad_norm):6.2f} "
                 f"uniq_disc={unique_discrete}/18 frac_cont_uniq={frac_cont_unique:.3f} "
-                f"|a|_mean={action_abs_mean:.3f}"
+                f"|a|_mean={action_abs_mean:.3f} |dQ/da|={mean_abs_dqda:.4f} Qrange={q_range_corners:.3f}"
             )
 
         # Evaluation
