@@ -53,16 +53,22 @@ def evaluate(
 
         return next_obs, next_state, reward, done, info
 
+    low = jnp.array(env.action_space().low)
+    high = jnp.array(env.action_space().high)
+    action_scale = (high - low) / 2.0
+    action_bias = (high + low) / 2.0
+
     key, reset_key = jax.random.split(key)
     actor_encoder = _Encoder()
-    actor = _Actor(action_dim=env.action_space().shape[0])
     critic1_encoder = _Encoder()
     critic2_encoder = _Encoder()
-    qf1 = _SoftQNetwork()
-    qf2 = _SoftQNetwork()
+    qf1 = _SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
+    qf2 = _SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
     key, actor_encoder_key, actor_key, critic1_encoder_key, qf1_key, critic2_encoder_key, qf2_key = (
         jax.random.split(key, 7)
     )
+
+    actor = _Actor(action_dim=env.action_space().shape[0])
     sample_obs = env.observation_space().sample(jax.random.PRNGKey(0))
     if sample_obs.ndim == 3:
         sample_obs = sample_obs[None, ..., None]
@@ -96,9 +102,6 @@ def evaluate(
         (args, (actor_params, critic1_params, critic2_params)) = flax.serialization.from_bytes(
             (None, (actor_params, critic1_params, critic2_params)), f.read()
         )
-
-    low = jnp.array(env.action_space().low)
-    high = jnp.array(env.action_space().high)
 
     @jax.jit
     def get_action(actor_params, next_obs, key):

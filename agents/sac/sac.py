@@ -188,10 +188,32 @@ class Actor(nn.Module):
 
 
 class SoftQNetwork(nn.Module):
-    """Q(s,a) network (Critic): takes hidden features + action, concatenates them."""
+    """Q(s,a) network (Critic): takes hidden features + action, concatenates them.
+
+    The action is first normalized to [-1, 1] per-dimension (using the env's
+    action_scale/action_bias) and projected into a 256-dim space before
+    concatenation with the (512-dim) state features. Without this, the 3-dim
+    action is drowned out by the 512-dim state features and the critic becomes
+    flat w.r.t. the action — the actor then receives no policy gradient and
+    training collapses (the observed failure mode: |dQ/da| ~ 0.003, |g_act| -> 0.01).
+    """
+    action_scale: jnp.ndarray
+    action_bias: jnp.ndarray
+
     @nn.compact
     def __call__(self, x, a):
-        # Concatenate hidden features with action
+        # Normalize the env-domain action to [-1, 1] per-dimension so all action
+        # components have equal scale (theta spans 2*pi, r/fire span 1.0).
+        a = (a - self.action_bias) / self.action_scale
+        # Project the action into a higher-dimensional space so it has a
+        # meaningful influence on the Q value (avoids the "flat critic" collapse).
+        # NOTE: no ReLU here — the actor's mean starts near 0, so sampled actions
+        # are near the center of the action space (which normalizes to ~0). A ReLU
+        # would kill the action gradient at initialization (ReLU(0)=0, grad=0).
+        # A non-zero bias ensures the projected action is non-zero even at the
+        # center action, so the action gradient always flows.
+        a = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.1))(a)
+        # Concatenate hidden features with the projected action
         x = jnp.concatenate([x, a], axis=-1)
         x = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         x = nn.relu(x)
@@ -278,10 +300,10 @@ def single_run(config: dict):
 
     actor = Actor(action_dim=action_dim)
 
-    qf1 = SoftQNetwork()
-    qf2 = SoftQNetwork()
-    qf1_target = SoftQNetwork()
-    qf2_target = SoftQNetwork()
+    qf1 = SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
+    qf2 = SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
+    qf1_target = SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
+    qf2_target = SoftQNetwork(action_scale=action_scale, action_bias=action_bias)
 
     # Dummy inputs
     sample_obs = jnp.zeros(
