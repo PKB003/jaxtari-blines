@@ -286,6 +286,18 @@ def single_run(config: dict):
     print(f"[ENV] action_high={action_space.high}")
     print(f"[ENV] action_scale={action_scale.tolist()}")
     print(f"[ENV] action_bias={action_bias.tolist()}")
+    # Dopamine's SAC (dopamine_sac_agent.py train(), line ~167) scales the
+    # reward before adding the entropy bonus:
+    #   target = reward_scale_factor * reward
+    #          + gamma * (1 - done) * (target_q - alpha * log_prob)
+    # For reward-clipped Atari (rewards ∈ {+1,0,-1}) the per-step mean reward
+    # (~ -0.027 for a losing Pong game) is SMALLER than the entropy bonus
+    # (-alpha*logp ≈ +0.033 with alpha=0.0183), so without scaling the entropy
+    # term dominates and Q collapses to a flat ≈0.2 for every action → the actor
+    # sees ∇_a Q ≈ 0 → policy freezes uniform and returns stay at -21.
+    # DQN/PPO don't need this knob because they have no entropy bonus.
+    reward_scale = float(config.get("REWARD_SCALE_FACTOR", 100.0))
+    print(f"[ENV] reward_scale_factor={reward_scale} (SAC entropy-bonus compensation)")
 
     # Vectorized environment wrappers
     @jax.jit
@@ -612,8 +624,20 @@ def single_run(config: dict):
         qf1_next_target = qf1.apply(qf1_target_params["qf"], z1_next, next_action).squeeze(-1)
         qf2_next_target = qf2.apply(qf2_target_params["qf"], z2_next, next_action).squeeze(-1)
         min_qf_next_target = jnp.minimum(qf1_next_target, qf2_next_target) - alpha * next_log_prob
-        next_q_value = batch.reward + config["GAMMA"] * (1.0 - batch.done) * min_qf_next_target
+
+        # Reward scaling (dopamine reward_scale_factor): clipped Atari rewards
+        # (±1/0) are smaller than the SAC entropy bonus (-alpha*logp ≈ +0.033),
+        # so without scaling the entropy term dominates and Q collapses flat.
+        # Scale the REAL reward so it dominates the entropy bonus and the critic
+        # can actually distinguish good from bad actions.
+        next_q_value = reward_scale * batch.reward + config["GAMMA"] * (1.0 - batch.done) * min_qf_next_target
         next_q_value = jax.lax.stop_gradient(next_q_value)
+
+        # DEBUG: entropy-gap diagnostics (compared vs the raw reward magnitude).
+        mean_entropy_bonus = (alpha * next_log_prob).mean()
+        mean_scaled_reward = (reward_scale * batch.reward).mean()
+        mean_raw_reward = batch.reward.mean()
+        frac_nonterminal = (1.0 - batch.done).mean()
 
         # ---- current Q values (critics receive the CALE-domain buffer action) ----
         def critic_loss_fn(params1, params2):
@@ -646,6 +670,7 @@ def single_run(config: dict):
                 qf1_grad_norm, qf2_grad_norm,
                 qf1_enc_grad_norm, qf1_q_grad_norm,
                 qf2_enc_grad_norm, qf2_q_grad_norm,
+                mean_entropy_bonus, mean_scaled_reward, mean_raw_reward, frac_nonterminal,
                 key)
 
     @jax.jit
@@ -1187,11 +1212,17 @@ def single_run(config: dict):
                  qf1_grad_norm, qf2_grad_norm,
                  qf1_enc_grad_norm, qf1_q_grad_norm,
                  qf2_enc_grad_norm, qf2_q_grad_norm,
+                 mean_entropy_bonus, mean_scaled_reward, mean_raw_reward, frac_nonterminal,
                  key) = update_qf(
                     qf1_state, qf2_state,
                     qf1_target_params, qf2_target_params,
                     actor_target_params, current_alpha, batch, key,
                 )
+                # If no Q update this step (buffer not ready), hold debug values.
+                entropy_bonus_log = mean_entropy_bonus
+                scaled_reward_log = mean_scaled_reward
+                raw_reward_log = mean_raw_reward
+                nonterminal_log = frac_nonterminal
 
                 # Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
                 if global_step % config["POLICY_FREQUENCY"] == 0:
@@ -1318,6 +1349,12 @@ def single_run(config: dict):
                 "losses/alpha_loss": alpha_loss,
                 "losses/alpha": current_alpha,
                 "reward": jnp.mean(batch.reward),
+                # ---- entropy-gap diagnostics ----
+                "debug/entropy_bonus": entropy_bonus_log,
+                "debug/scaled_reward": scaled_reward_log,
+                "debug/raw_reward": raw_reward_log,
+                "debug/frac_nonterminal": nonterminal_log,
+                "debug/reward_scale": reward_scale,
                 "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
@@ -1350,7 +1387,8 @@ def single_run(config: dict):
                 f"|g_act|={_to_float(actor_grad_norm):6.2f} |g_enc_act|={_to_float(actor_enc_grad_norm):6.2f} "
                 f"|g_q1|={_to_float(qf1_grad_norm):6.2f} |g_q2|={_to_float(qf2_grad_norm):6.2f} "
                 f"uniq_disc={unique_discrete}/18 frac_cont_uniq={frac_cont_unique:.3f} "
-                f"|a|_mean={action_abs_mean:.3f} |dQ/da|={mean_abs_dqda:.4f} Qrange={q_range_corners:.3f}"
+                f"|a|_mean={action_abs_mean:.3f} |dQ/da|={mean_abs_dqda:.4f} Qrange={q_range_corners:.3f} "
+                f"ent_bonus={_to_float(entropy_bonus_log):.3f} scaled_rew={_to_float(scaled_reward_log):.1f}"
             )
 
         # Evaluation

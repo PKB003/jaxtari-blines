@@ -22,6 +22,14 @@ ALPHA_LR: 0.001
 POLICY_FREQUENCY: 2
 TARGET_NETWORK_FREQUENCY: 1
 
+# Dopamine reward_scale_factor: clipped Atari rewards (±1/0) have a mean of
+# ~-0.027 (losing Pong) which is SMALLER than the SAC entropy bonus
+# (-alpha*logp ≈ +0.033). Without scaling, the entropy term dominates the
+# Q-target and Q collapses to a flat ≈0.2 for every action → the actor sees
+# ∇_a Q ≈ 0 → policy freezes uniform and returns stay at -21.
+# DQN/PPO don't need this knob because they have no entropy bonus.
+REWARD_SCALE_FACTOR: 100.0
+
 # Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
 # Set to False to keep it on GPU (faster but uses much more VRAM).
 BUFFER_ON_CPU: True
