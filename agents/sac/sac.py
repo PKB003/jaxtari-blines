@@ -41,7 +41,12 @@ from agents.sac.sac_eval import evaluate
 # so once alpha collapses to ~1e-4 it can never recover (gradient ~ 0). Clamping
 # log_alpha to this range guarantees alpha >= ~0.02 so the entropy regularizer
 # always has a floor and can rise again if the policy becomes under-entropic.
-LOG_ALPHA_MIN = -4.0   # alpha >= ~0.018
+# NOTE: -2.0 gives alpha >= ~0.135 (not -4.0 / 0.018). The observed instability
+# showed that with alpha <= 0.018 the exploratory entropy gradient is negligible
+# in the flat-Q phase, so the policy re-stalls; and the entropy bonus is too
+# small to smooth the double-critic bootstrap. -2.0 keeps entropy meaningful
+# while still preventing the runaway collapse to ~1e-4.
+LOG_ALPHA_MIN = -2.0   # alpha >= ~0.135
 LOG_ALPHA_MAX = 5.0    # alpha <= ~148
 
 
@@ -296,7 +301,15 @@ def single_run(config: dict):
     # term dominates and Q collapses to a flat ≈0.2 for every action → the actor
     # sees ∇_a Q ≈ 0 → policy freezes uniform and returns stay at -21.
     # DQN/PPO don't need this knob because they have no entropy bonus.
-    reward_scale = float(config.get("REWARD_SCALE_FACTOR", 100.0))
+    # Calibration note (from the 201k-step log): with REWARD_SCALE_FACTOR=100 the
+    # critic target oscillates between +100 and -100 (clipped ±1 rewards), giving
+    # the MSE a variance ~10^4 that the critic cannot fit → Q diverges (observed
+    # |g_q1| ~ 8000, Q ~ -108 at ITER 158-200). With SCALE=10 the target range is
+    # ±10 (fit-able) while scaled reward (-0.27/step) still dominates the entropy
+    # bonus (+0.24/step at alpha-floor 0.135) → the entropy-gap fixed point is
+    # broken without divergence. DQN/PPO scale nothing because they have no
+    # entropy term; dopamine's SAC uses reward_scale_factor=1.0 on dense rewards.
+    reward_scale = float(config.get("REWARD_SCALE_FACTOR", 10.0))
     print(f"[ENV] reward_scale_factor={reward_scale} (SAC entropy-bonus compensation)")
 
     # Vectorized environment wrappers
