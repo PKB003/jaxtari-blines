@@ -37,6 +37,14 @@ from rtpt import RTPT
 from agents.sac.sac_eval import evaluate
 
 
+# Alpha deadlock guard: the alpha gradient is proportional to exp(log_alpha),
+# so once alpha collapses to ~1e-4 it can never recover (gradient ~ 0). Clamping
+# log_alpha to this range guarantees alpha >= ~0.02 so the entropy regularizer
+# always has a floor and can rise again if the policy becomes under-entropic.
+LOG_ALPHA_MIN = -4.0   # alpha >= ~0.018
+LOG_ALPHA_MAX = 5.0    # alpha <= ~148
+
+
 def get_gpu_stats():
     """Return (memory_used_MB, memory_total_MB, utilization_percent) for the first GPU."""
     try:
@@ -422,7 +430,12 @@ def single_run(config: dict):
         params=actor_train_params,
         tx=actor_optimizer,
     )
-    # Target Critic parameters
+    # Target Critic parameters (+ target Actor encoder/head, updated jointly).
+    # Dopamine's SAC uses a *target actor* to sample the next action for the
+    # critic target (see dopamine_sac_agent.py train()). This decouples the
+    # Q-target bootstrap from the fast-moving current actor, preventing the
+    # feedback loop where a collapsing actor inflates Q and Q collapses the
+    # actor further.
     qf1_target_params = {
         "encoder": critic1_encoder_params,
         "qf": qf1_params,
@@ -431,6 +444,11 @@ def single_run(config: dict):
     qf2_target_params = {
         "encoder": critic2_encoder_params,
         "qf": qf2_params,
+    }
+
+    actor_target_params = {
+        "encoder": actor_encoder_params,
+        "actor": actor_params,
     }
     # Automatic entropy tuning
     if config["AUTOTUNE"]:
@@ -567,19 +585,23 @@ def single_run(config: dict):
     def update_qf(
         qf1_state, qf2_state,
         qf1_target_params, qf2_target_params,
-        actor_state, alpha, batch, key,
+        actor_target_params, alpha, batch, key,
     ):
         """Update Critic 1 (encoder + Q1) and Critic 2 (encoder + Q2) independently.
 
         Gradient isolation:
           - qf1_state.params ({"encoder", "qf"}) receives gradients from Q1 loss only
           - qf2_state.params ({"encoder", "qf"}) receives gradients from Q2 loss only
-          - the actor is used only for the target action / log-prob and is NOT
-            differentiated (target is stop_gradient; actor params are not argnums).
+          - the TARGET actor is used only for the target action / log-prob and is
+            NOT differentiated (target is stop_gradient; target params are not argnums).
+          Using the slow target actor for next actions (dopamine sac_cale style)
+            decouples the Q bootstrap from the fast current actor, preventing the
+            feedback loop where a collapsing actor inflates Q and Q collapses the
+            actor further.
         """
-        # ---- sample next action from the CURRENT actor (no target actor) ----
-        next_hidden = actor_encoder.apply(actor_state.params["encoder"], batch.next_obs)
-        next_mean, next_log_std = actor.apply(actor_state.params["actor"], next_hidden)
+        # ---- sample next action from the TARGET actor (dopamine sac_cale) ----
+        next_hidden = actor_encoder.apply(actor_target_params["encoder"], batch.next_obs)
+        next_mean, next_log_std = actor.apply(actor_target_params["actor"], next_hidden)
         key, subkey = jax.random.split(key)
         next_action, next_log_prob, _ = sample_env_action(next_mean, next_log_std, subkey)
 
@@ -772,7 +794,20 @@ def single_run(config: dict):
             )
 
             # IMPORTANT:
-            # recompute alpha AFTER optimizer update
+            # clamp log_alpha so alpha cannot deadlock near 0 (~1e-4 → gradient ~ 0)
+            # and the entropy regularizer can always recover if the policy becomes
+            # under-entropic. This is the standard SafeSAC/dopamine style bound.
+            clipped_log_alpha = jnp.clip(
+                new_alpha_state.params["log_alpha"],
+                LOG_ALPHA_MIN,
+                LOG_ALPHA_MAX,
+            )
+            new_alpha_state = new_alpha_state.replace(
+                params={"log_alpha": clipped_log_alpha}
+            )
+
+            # IMPORTANT:
+            # recompute alpha AFTER optimizer update + clamp
             new_alpha = jnp.exp(
                 new_alpha_state.params["log_alpha"]
             )
@@ -811,15 +846,24 @@ def single_run(config: dict):
         )
 
     @jax.jit
-    def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params, tau):
-        """Soft-update target networks (jitted to avoid per-call kernel dispatch)."""
+    def target_update(qf1_state, qf2_state, qf1_target_params, qf2_target_params,
+                      actor_state, actor_target_params, tau):
+        """Soft-update target networks (jitted to avoid per-call kernel dispatch).
+
+        Updates the target actor alongside the target critics. The target actor
+        is used for Q-target next actions (dopamine sac_cale style), so it must
+        track the current actor slowly to keep the Q bootstrap stable.
+        """
         new_qf1_target_params = optax.incremental_update(
             qf1_state.params, qf1_target_params, tau
         )
         new_qf2_target_params = optax.incremental_update(
             qf2_state.params, qf2_target_params, tau
         )
-        return new_qf1_target_params, new_qf2_target_params
+        new_actor_target_params = optax.incremental_update(
+            actor_state.params, actor_target_params, tau
+        )
+        return new_qf1_target_params, new_qf2_target_params, new_actor_target_params
 
     # ---------- Save and eval function ----------
     def save_and_eval(iteration, actor_state, qf1_state, qf2_state):
@@ -1146,7 +1190,7 @@ def single_run(config: dict):
                  key) = update_qf(
                     qf1_state, qf2_state,
                     qf1_target_params, qf2_target_params,
-                    actor_state, current_alpha, batch, key,
+                    actor_target_params, current_alpha, batch, key,
                 )
 
                 # Actor + Alpha update (delayed: every POLICY_FREQUENCY steps)
@@ -1184,8 +1228,9 @@ def single_run(config: dict):
 
                 # Target network update (every TARGET_NETWORK_FREQUENCY steps)
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
-                    qf1_target_params, qf2_target_params = target_update(
-                        qf1_state, qf2_state, qf1_target_params, qf2_target_params, config["TAU"]
+                    qf1_target_params, qf2_target_params, actor_target_params = target_update(
+                        qf1_state, qf2_state, qf1_target_params, qf2_target_params,
+                        actor_state, actor_target_params, config["TAU"],
                     )
 
         # Flush any transitions still pending in this iteration so they are
