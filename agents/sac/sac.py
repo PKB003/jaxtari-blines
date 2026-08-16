@@ -37,16 +37,16 @@ from rtpt import RTPT
 from agents.sac.sac_eval import evaluate
 
 
-# Alpha deadlock guard: the alpha gradient is proportional to exp(log_alpha),
-# so once alpha collapses to ~1e-4 it can never recover (gradient ~ 0). Clamping
-# log_alpha to this range guarantees alpha >= ~0.02 so the entropy regularizer
-# always has a floor and can rise again if the policy becomes under-entropic.
-# NOTE: -2.0 gives alpha >= ~0.135 (not -4.0 / 0.018). The observed instability
-# showed that with alpha <= 0.018 the exploratory entropy gradient is negligible
-# in the flat-Q phase, so the policy re-stalls; and the entropy bonus is too
-# small to smooth the double-critic bootstrap. -2.0 keeps entropy meaningful
-# while still preventing the runaway collapse to ~1e-4.
-LOG_ALPHA_MIN = -2.0   # alpha >= ~0.135
+# Alpha guard (final calibration from the 112k-step pixel + 500k-step OC logs):
+# Observed alpha pinned at exactly exp(-2) = 0.1353 for 80-90% of training when
+# LOG_ALPHA_MIN=-2, in BOTH pixel (diverged Q) and OC (stuck after +18) runs.
+# With entropy H=1.80 vs target 1.5, autotune's gradient is >0 and wants a
+# HIGHER alpha (sharpen an over-random policy) — the floor binding downstream
+# of the flat-Q equilibrium froze the teacher, keeping the policy random and
+# Q in the -77 pit (pixel) or frozen (OC). REWARD_SCALE_FACTOR=10 now keeps
+# the entropy bonus in scale, so the old "vanishing-alpha" deadlock is gone.
+# A near-zero floor lets autotune escape this state.
+LOG_ALPHA_MIN = -8.0   # alpha >= ~3.3e-4 (essentially unrestricted)
 LOG_ALPHA_MAX = 5.0    # alpha <= ~148
 
 
@@ -181,10 +181,19 @@ class MLPEncoder(nn.Module):
 
 
 class Actor(nn.Module):
-    """Gaussian policy for continuous actions."""
+    """Gaussian policy for continuous actions.
+
+    Bounds on log_std are narrowed from CleanRL's default (-5, 2): with the
+    CALE wrapper, a 3-dim action controls a discrete-style joystick, and both
+    the OC "freeze" and pixel divergence logs showed the mean saturating tanh
+    while std → e^-5 ≈ 0.007 → the actor emits a fixed joystick direction and
+    the episode "freezes". Keeping std in [exp(-2.5), exp(1.0)] ≈ [0.08, 2.7]
+    preserves meaningful exploratory noise in the linear tanh region while
+    still allowing a near-deterministic policy for later training.
+    """
     action_dim: int
-    log_std_min: float = -5.0   # CleanRL default
-    log_std_max: float = 2.0    # CleanRL default
+    log_std_min: float = -2.5   # sigma >= ~0.082 (avoid the dead-zone freeze)
+    log_std_max: float = 1.0    # sigma <= ~2.72
 
     @nn.compact
     def __call__(self, x):
@@ -325,6 +334,10 @@ def single_run(config: dict):
         return next_obs, state, reward, next_done, info
 
     # Networks
+    # Keep three separate encoders (one per network). Pixel/OC both train with
+    # the fixed log_std bounds + freed alpha; a true dopamine-style SHARED
+    # encoder would require a single joint optimizer (bigger rewrite), so it is
+    # NOT applied here to keep the change minimal and low-risk.
     encoder_cls = CNNEncoder if config["PIXEL_BASED"] else MLPEncoder
 
     critic1_encoder = encoder_cls()
