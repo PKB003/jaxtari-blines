@@ -102,4 +102,6 @@ def evaluate(
     slice_end = jnp.where(has_done, first_done_idx + 1, dones.shape[0])
     env_states_until_done = jax.tree.map(lambda x: x[:slice_end], first_states)
 
-    return episodic_returns, env_states_until_done
+    raw_env_states_until_done = env_states_until_done.atari_state.atari_state.env_state
+
+    return episodic_returns, raw_env_states_until_done
