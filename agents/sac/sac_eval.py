@@ -47,8 +47,7 @@ def evaluate(
     qf2 = _SoftQNetwork()
 
     sample_obs = env.observation_space().sample(jax.random.PRNGKey(0))
-    if sample_obs.ndim in (1, 3):
-        sample_obs = sample_obs[None, ...]
+    sample_obs = sample_obs[None, ...]
 
     sample_obs = sample_obs.astype(jnp.float32)
 
