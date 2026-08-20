@@ -17,9 +17,10 @@ ALPHA: 0.2
 AUTOTUNE: True
 
 POLICY_LR: 0.0003
-Q_LR: 0.001
-ALPHA_LR: 0.001
-POLICY_FREQUENCY: 2
+Q_LR: 0.0003
+ALPHA_LR: 0.0003
+ENCODER_LR: 0.0003
+POLICY_FREQUENCY: 1
 TARGET_NETWORK_FREQUENCY: 1
 
 # Dopamine reward_scale_factor: clipped Atari rewards (±1/0) have a mean of
