@@ -8,7 +8,6 @@ import random
 import subprocess
 import time
 import tempfile
-from collections import deque
 from functools import partial
 from typing import Optional
 
@@ -347,20 +346,6 @@ def single_run(config: dict):
         mean, _ = actor.apply(actor_state.params, hidden)
         return deterministic_env_action(mean)
 
-    @jax.jit
-    def inspect_q_and_grad(encoder_params, qf1_params, obs0, a1, a2, a3):
-        """Jitted diagnostic function to compute Q values and gradients without re-tracing."""
-        z = shared_encoder.apply(encoder_params, obs0)
-        qv1 = qf1.apply(qf1_params, z, a1).squeeze()
-        qv2 = qf1.apply(qf1_params, z, a2).squeeze()
-        qv3 = qf1.apply(qf1_params, z, a3).squeeze()
-
-        def q_of_a(a):
-            return qf1.apply(qf1_params, z, a).sum()
-
-        dq_da = jax.grad(q_of_a)(a2)
-        return qv1, qv2, qv3, dq_da
-
     def remove_env_dim(x):
         if x.ndim >= 2 and x.shape[1] > 1:
             return x.reshape((-1,) + x.shape[2:])
@@ -374,17 +359,6 @@ def single_run(config: dict):
 
     def _to_float(x):
         return float(np.asarray(x).reshape(-1)[0])
-
-    def discrete_action_id(action, tau=0.5):
-        if action.shape[-1] != 3:
-            return jnp.zeros(action.shape[:-1], dtype=jnp.int32)
-        r, theta, fire = action[..., 0], action[..., 1], action[..., 2]
-        x = r * jnp.cos(theta)
-        y = r * jnp.sin(theta)
-        x_idx = (x > tau).astype(jnp.int32) - (x < -tau).astype(jnp.int32) + 1
-        y_idx = (y > tau).astype(jnp.int32) - (y < -tau).astype(jnp.int32) + 1
-        fire_idx = (fire > tau).astype(jnp.int32)
-        return x_idx * 6 + y_idx * 2 + fire_idx
 
     @jax.jit
     def update_qf(
@@ -407,11 +381,6 @@ def single_run(config: dict):
         next_q_value = reward_scale * batch.reward + config["GAMMA"] * (1.0 - batch.done) * min_qf_next_target
         next_q_value = jax.lax.stop_gradient(next_q_value)
 
-        mean_entropy_bonus = (alpha * next_log_prob).mean()
-        mean_scaled_reward = (reward_scale * batch.reward).mean()
-        mean_raw_reward = batch.reward.mean()
-        frac_nonterminal = (1.0 - batch.done).mean()
-
         def critic_loss_fn(enc_params, qf1_params, qf2_params):
             z = shared_encoder.apply(enc_params, batch.obs)
             qf1_a = qf1.apply(qf1_params, z, batch.action).squeeze(-1)
@@ -431,17 +400,10 @@ def single_run(config: dict):
 
         qf1_grad_norm = _g_norm(qf1_grads)
         qf2_grad_norm = _g_norm(qf2_grads)
-        qf1_enc_grad_norm = _g_norm(enc_grads)
-        qf1_q_grad_norm = _g_norm(qf1_grads)
-        qf2_enc_grad_norm = _g_norm(enc_grads)
-        qf2_q_grad_norm = _g_norm(qf2_grads)
 
         return (new_encoder_state, new_qf1_state, new_qf2_state, qf_loss, qf1_loss, qf2_loss,
                 qf1_values, qf2_values, next_q_value.mean(),
                 qf1_grad_norm, qf2_grad_norm,
-                qf1_enc_grad_norm, qf1_q_grad_norm,
-                qf2_enc_grad_norm, qf2_q_grad_norm,
-                mean_entropy_bonus, mean_scaled_reward, mean_raw_reward, frac_nonterminal,
                 key)
 
     @jax.jit
@@ -499,9 +461,6 @@ def single_run(config: dict):
             log_prob_mean = jnp.array(0.0)
 
         actor_grad_norm = _g_norm(actor_grads)
-        actor_enc_grad_norm = jnp.array(0.0)
-        actor_mlp_grad_norm = actor_grad_norm
-        alpha_grad_norm = _g_norm(alpha_grads) if config["AUTOTUNE"] else jnp.array(0.0)
 
         return (
             encoder_state,  # Encoder untouched by actor step
@@ -512,9 +471,6 @@ def single_run(config: dict):
             log_prob_mean,
             alpha_loss,
             actor_grad_norm,
-            actor_enc_grad_norm,
-            actor_mlp_grad_norm,
-            alpha_grad_norm,
             key,
         )
 
@@ -729,16 +685,12 @@ def single_run(config: dict):
     steps_per_iteration = config["SCAN_STEPS"]
     num_iterations = total_timesteps // (num_envs * steps_per_iteration) + 1
 
-    recent_actions = deque(maxlen=200)
-
     for iteration in range(num_iterations):
         rtpt.step()
 
         for local_step in range(steps_per_iteration):
             key, subkey = jax.random.split(key)
             action, key = sample_action(encoder_state, actor_state, obs, subkey)
-
-            recent_actions.append(np.asarray(action).reshape(-1, action_dim))
 
             next_obs, env_state, reward, terminated, next_done, info = vmap_step(env_state, action)
 
@@ -786,9 +738,6 @@ def single_run(config: dict):
                 (encoder_state, qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
                  qf1_values, qf2_values, next_q_values,
                  qf1_grad_norm, qf2_grad_norm,
-                 qf1_enc_grad_norm, qf1_q_grad_norm,
-                 qf2_enc_grad_norm, qf2_q_grad_norm,
-                 mean_entropy_bonus, mean_scaled_reward, mean_raw_reward, frac_nonterminal,
                  key) = update_qf(
                     encoder_state, qf1_state, qf2_state, actor_state,
                     encoder_target_params, qf1_target_params, qf2_target_params,
@@ -806,9 +755,6 @@ def single_run(config: dict):
                         log_prob_mean,
                         alpha_loss,
                         actor_grad_norm,
-                        actor_enc_grad_norm,
-                        actor_mlp_grad_norm,
-                        alpha_grad_norm,
                         key,
                     ) = update_actor_and_alpha(
                         encoder_state, actor_state, qf1_state, qf2_state,
@@ -819,9 +765,6 @@ def single_run(config: dict):
                     log_prob_mean = jnp.array(0.0)
                     alpha_loss = jnp.array(0.0)
                     actor_grad_norm = jnp.array(0.0)
-                    actor_enc_grad_norm = jnp.array(0.0)
-                    actor_mlp_grad_norm = jnp.array(0.0)
-                    alpha_grad_norm = jnp.array(0.0)
 
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
                     encoder_target_params, qf1_target_params, qf2_target_params, actor_target_params = target_update(
@@ -838,21 +781,6 @@ def single_run(config: dict):
             avg_return = info["returned_episode_returns"].mean() if "returned_episode_returns" in info else 0.0
             avg_length = info["returned_episode_lengths"].mean() if "returned_episode_lengths" in info else 0.0
 
-            recent_as = np.vstack(recent_actions) if recent_actions else np.zeros((1, action_dim))
-            recent_ids = np.asarray(jax.device_get(discrete_action_id(jnp.array(recent_as, dtype=jnp.float32))))
-            unique_discrete = int(np.unique(recent_ids).size)
-            frac_cont_unique = float(len(np.unique(np.round(recent_as, 4), axis=0))) / max(len(recent_as), 1)
-            action_abs_mean = float(np.abs(recent_as).mean()) if len(recent_as) else 0.0
-
-            obs0 = batch.obs[:1]
-            a1 = jnp.array([[0.0, -jnp.pi, 0.0]], dtype=jnp.float32)
-            a2 = jnp.array([[0.5, 0.0, 0.5]], dtype=jnp.float32)
-            a3 = jnp.array([[1.0, jnp.pi, 1.0]], dtype=jnp.float32)
-
-            qv1, qv2, qv3, dq_da = inspect_q_and_grad(encoder_state.params, qf1_state.params, obs0, a1, a2, a3)
-            q_range_corners = _to_float(qv3) - _to_float(qv1)
-            mean_abs_dqda = _to_float(jnp.mean(jnp.abs(dq_da)))
-
             metrics = jax.device_get({
                 "charts/avg_episodic_return": avg_return,
                 "charts/avg_episodic_length": avg_length,
@@ -866,29 +794,9 @@ def single_run(config: dict):
                 "losses/alpha_loss": alpha_loss,
                 "losses/alpha": current_alpha,
                 "reward": jnp.mean(batch.reward),
-                "debug/entropy_bonus": mean_entropy_bonus,
-                "debug/scaled_reward": mean_scaled_reward,
-                "debug/raw_reward": mean_raw_reward,
-                "debug/frac_nonterminal": frac_nonterminal,
-                "debug/reward_scale": reward_scale,
                 "charts/SPS": global_step / (time.time() - start_time + 1e-8),
                 "charts/global_step": global_step,
                 "charts/iteration": iteration,
-                "debug/unique_discrete_actions": unique_discrete,
-                "debug/fraction_cont_unique": frac_cont_unique,
-                "debug/action_abs_mean": action_abs_mean,
-                "debug/q_range_corners": q_range_corners,
-                "debug/mean_abs_dqda": mean_abs_dqda,
-                "debug/actor_grad_norm": actor_grad_norm,
-                "debug/actor_enc_grad_norm": actor_enc_grad_norm,
-                "debug/actor_mlp_grad_norm": actor_mlp_grad_norm,
-                "debug/alpha_grad_norm": alpha_grad_norm,
-                "debug/qf1_grad_norm": qf1_grad_norm,
-                "debug/qf2_grad_norm": qf2_grad_norm,
-                "debug/qf1_enc_grad_norm": qf1_enc_grad_norm,
-                "debug/qf1_q_grad_norm": qf1_q_grad_norm,
-                "debug/qf2_enc_grad_norm": qf2_enc_grad_norm,
-                "debug/qf2_q_grad_norm": qf2_q_grad_norm,
             })
             wandb.log(metrics, step=global_step)
 
@@ -899,9 +807,7 @@ def single_run(config: dict):
                 f"q2={_to_float(qf2_values):7.2f} qf_loss={_to_float(qf_loss):.4f} "
                 f"act_loss={_to_float(actor_loss):6.3f} "
                 f"|g_act|={_to_float(actor_grad_norm):6.2f} "
-                f"|g_q1|={_to_float(qf1_grad_norm):6.2f} |g_q2|={_to_float(qf2_grad_norm):6.2f} "
-                f"uniq_disc={unique_discrete}/18 frac_cont_uniq={frac_cont_unique:.3f} "
-                f"|a|_mean={action_abs_mean:.3f} |dQ/da|={mean_abs_dqda:.4f} Qrange={q_range_corners:.3f}"
+                f"|g_q1|={_to_float(qf1_grad_norm):6.2f} |g_q2|={_to_float(qf2_grad_norm):6.2f}"
             )
 
         if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:

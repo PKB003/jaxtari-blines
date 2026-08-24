@@ -95,6 +95,7 @@ def evaluate(
     mask_after_first_done = jnp.pad(has_finished[:-1, :], ((1, 0), (0, 0)), constant_values=0)
     masked_rewards = rewards * (1 - mask_after_first_done)
     episodic_returns = jnp.sum(masked_rewards, axis=0)
+    print(f"Evaluated {eval_episodes} episodes, mean return: {episodic_returns.mean():.2f}, std return: {episodic_returns.std():.2f}")
 
     # Robust slice of environment states for video logging (Episode 0)
     first_done_idx = jnp.argmax(dones[:, 0])
