@@ -60,6 +60,71 @@ def get_gpu_stats():
         return -1, -1, -1
 
 
+# ---------------------------------------------------------------------------
+# Measurement-only section profiler (opt-in via SAC_PROFILE=1).
+#
+# It wraps the training-loop sections in `jax.block_until_ready` so that wall
+# time can be attributed to a specific section instead of to "whatever the async
+# dispatch pipeline happened to overlap". Blocking *serialises* the pipeline, so
+# numbers gathered in this mode are a critical-path breakdown and NOT the
+# throughput of a normal run. The values that are computed are unchanged, so the
+# training trajectory is identical; the mode is only a measuring instrument.
+#
+# When SAC_PROFILE is unset, `prof` is None and each instrumented site pays a
+# single `if prof:` boolean test.
+# ---------------------------------------------------------------------------
+PROFILE_ENABLED = os.environ.get("SAC_PROFILE", "").strip().lower() in ("1", "true", "yes", "on")
+
+# Populated by `single_run` when profiling is enabled, so benchmark scripts can
+# read the breakdown programmatically.
+LAST_PROFILE = None
+
+
+class SectionProfiler:
+    """Accumulates per-section wall time (one entry per instrumented call site)."""
+
+    def __init__(self):
+        self.times = {}
+        self.calls = {}
+
+    def add(self, name, t0, value=None):
+        """Record the elapsed time since ``t0``; wait for ``value`` first when given."""
+        if value is not None:
+            leaves = jax.tree_util.tree_leaves(value)
+            if leaves:
+                jax.block_until_ready(leaves)
+        dt = time.perf_counter() - t0
+        self.times[name] = self.times.get(name, 0.0) + dt
+        self.calls[name] = self.calls.get(name, 0) + 1
+
+    @property
+    def total(self):
+        return sum(self.times.values())
+
+    @property
+    def training_total(self):
+        """Sum of the sections that run once per environment step (excludes warmup-fill)."""
+        return sum(v for k, v in self.times.items() if not k.startswith("warmup/"))
+
+    def summary(self, steps=None, wall_s=None, title=None):
+        lines = []
+        if title:
+            lines.append(title)
+        lines.append(f"{'section':<24}{'total s':>10}{'calls':>9}{'ms/call':>10}{'% profiled':>12}")
+        for name, secs in sorted(self.times.items(), key=lambda kv: -kv[1]):
+            calls = self.calls[name]
+            pct = 100.0 * secs / self.total if self.total else 0.0
+            lines.append(f"{name:<24}{secs:>10.2f}{calls:>9}{1000.0 * secs / calls:>10.3f}{pct:>11.1f}%")
+        lines.append(f"{'PROFILED TOTAL':<24}{self.total:>10.2f}")
+        if steps and self.training_total:
+            lines.append(f"{'training ms/env-step (profiled)':<24}"
+                         f"{1000.0 * self.training_total / steps:>10.3f}")
+        if wall_s and steps:
+            lines.append(f"{'training window s (real)':<24}{wall_s:>10.2f}   "
+                         f"-> {steps / wall_s:7.1f} SPS (async, unblocked)")
+        return "\n".join(lines)
+
+
 def make_env(
     env_id: str,
     mods: Optional[list] = None,
@@ -332,12 +397,19 @@ def single_run(config: dict):
         return action_bias + action_scale * jnp.tanh(mean)
 
     # ---------- JIT functions ----------
+    # NOTE (perf): the key split that used to happen inline in the training loop is folded
+    # into this function so that one environment step costs a single dispatch instead of two.
+    # The split order -- and therefore the exact PRNG stream -- is unchanged:
+    #   before: key, subkey = split(key);  action, key = sample_action(..., subkey)
+    #           (sample_action internally did: key, subkey = split(subkey))
+    #   after : key, subkey = split(key);  key, action_key = split(subkey)
     @jax.jit
     def sample_action(encoder_state, actor_state, obs, key):
+        key, subkey = jax.random.split(key)
         hidden = shared_encoder.apply(encoder_state.params, obs)
         mean, log_std = actor.apply(actor_state.params, hidden)
-        key, subkey = jax.random.split(key)
-        action_env, _, _ = sample_env_action(mean, log_std, subkey)
+        key, action_key = jax.random.split(subkey)
+        action_env, _, _ = sample_env_action(mean, log_std, action_key)
         return action_env, key
 
     @jax.jit
@@ -352,6 +424,13 @@ def single_run(config: dict):
         if x.ndim >= 2 and x.shape[1] == 1:
             return x.squeeze(1)
         return x
+
+    def as_dtype(x, dtype):
+        """Cast ``x`` to ``dtype`` without dispatching a no-op op when the dtype already
+        matches. ``astype`` on an already-matching dtype still enqueues a copy on the
+        device; the resulting values are identical, so skipping it is behaviour-preserving
+        and removes one device dispatch per transition field."""
+        return x if x.dtype == dtype else x.astype(dtype)
 
     def _g_norm(*pytrees):
         flat, _ = jax.flatten_util.ravel_pytree(pytrees)
@@ -584,6 +663,15 @@ def single_run(config: dict):
     buffer_on_cpu = config.get("BUFFER_ON_CPU", True)
     cpu_device = jax.devices("cpu")[0] if buffer_on_cpu else None
 
+    # Device that runs the network updates. The old code called `jax.devices("gpu")[0]` on
+    # *every* training step; the lookup is static, so resolve it once. Behaviour on a GPU
+    # host is unchanged (still prefers the GPU); on a GPU-less host it now falls back to the
+    # default device instead of raising.
+    try:
+        compute_device = jax.devices("gpu")[0]
+    except RuntimeError:
+        compute_device = jax.devices()[0]
+
     dummy_transition = Transition(
         obs=obs,
         action=jnp.zeros((config["NUM_ENVS"], action_dim), dtype=jnp.float32),
@@ -603,22 +691,61 @@ def single_run(config: dict):
     )
     buffer_state = buffer.init(dummy_transition)
 
+    # ---------------------------------------------------------------------------
+    # Replay buffer access.
+    #
+    # `buffer_add` donates the old buffer state (donate_argnums=(0,)): flashbax's `add`
+    # is a pure function, so the returned state is bit-for-bit identical, but XLA is now
+    # allowed to update the (multi-GB) replay experience arrays *in place* instead of
+    # allocating and writing a full copy of them on every call. This is the same pattern
+    # flashbax uses in its own tests (jax.jit(buffer.add, donate_argnums=0)).
+    #
+    # Invariant required by donation: the donated state must not be *read* afterwards.
+    # The only reader is `buffer_sample`, which is always dispatched before the next
+    # `buffer_add` on the same device (all replay ops share the CPU device when
+    # BUFFER_ON_CPU=True), so the reader has completed by the time the donation runs.
+    # `buffer_can_sample` used to be a *host-side* reader called on every step; it has
+    # been replaced by `can_sample_count` (see below), which removes both a per-step
+    # dispatch/sync and that reader.
+    # ---------------------------------------------------------------------------
+    max_buffer_length = config["BUFFER_SIZE"]
+    min_buffer_length = config["BATCH_SIZE"]
+
     if buffer_on_cpu:
-        @jax.jit(device=cpu_device)
+        @jax.jit(device=cpu_device, donate_argnums=(0,))
         def buffer_add(state, transition):
             return buffer.add(state, transition)
 
         @jax.jit(device=cpu_device)
         def buffer_sample(state, key):
             return buffer.sample(state, key)
-
-        @jax.jit(device=cpu_device)
-        def buffer_can_sample(state):
-            return buffer.can_sample(state)
     else:
-        buffer_add = buffer.add
-        buffer_sample = buffer.sample
-        buffer_can_sample = buffer.can_sample
+        buffer_add = jax.jit(buffer.add, donate_argnums=(0,))
+        buffer_sample = jax.jit(buffer.sample)
+
+    # Host-side equivalent of buffer.can_sample(state).
+    #
+    # flashbax implements `can_sample` as
+    #     state.is_full | (state.current_index >= min_length)
+    # where, after `n` transitions have been added,
+    #     is_full       == (n >= max_length)
+    #     current_index == n % max_length
+    # so the predicate is a pure function of the number of transitions added so far.
+    # It is monotone (once True it stays True), which is why tracking the count in Python
+    # is exactly equivalent to calling the (JIT-compiled, host-synchronising)
+    # `buffer.can_sample` on every step.
+    def can_sample_count(n_added):
+        return n_added >= max_buffer_length or (n_added % max_buffer_length) >= min_buffer_length
+
+    buffer_num_added = 0
+
+    # Measurement-only (SAC_PROFILE=1): see the SectionProfiler docstring. `None`
+    # in normal runs, in which case the instrumented sites below are a no-op.
+    global LAST_PROFILE
+    prof = SectionProfiler() if PROFILE_ENABLED else None
+    if prof is not None:
+        print("[SAC_PROFILE] section timing enabled; runs are serialised per section, "
+              "the training trajectory is unchanged.")
 
     print("Filling replay buffer with random actions...")
     steps_to_fill = int(learning_starts // num_envs) + 1
@@ -626,6 +753,7 @@ def single_run(config: dict):
     pending = []
 
     def flush_pending(pending, buffer_state):
+        nonlocal buffer_num_added
         if not pending:
             return buffer_state
         batch = Transition(
@@ -636,23 +764,32 @@ def single_run(config: dict):
             done=jnp.stack([t.done for t in pending], axis=0),
         )
         batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
+        buffer_num_added += len(pending) * num_envs
         return buffer_add(buffer_state, batch)
 
     for _ in range(steps_to_fill):
+        if prof:
+            t_sec = time.perf_counter()
         key, subkey = jax.random.split(key)
         action = jax.random.uniform(subkey, (num_envs, action_dim), minval=low, maxval=high)
         next_obs, env_state, reward, terminated, next_done, info = vmap_step(env_state, action)
+        if prof:
+            prof.add("warmup/env_step", t_sec, next_obs)
         obs_dtype = jnp.uint8 if config["PIXEL_BASED"] else jnp.float32
         transition = Transition(
-            obs.astype(obs_dtype),
+            as_dtype(obs, obs_dtype),
             action,
-            reward.astype(jnp.float32),
-            next_obs.astype(obs_dtype),
-            terminated.astype(jnp.bool_),
+            as_dtype(reward, jnp.float32),
+            as_dtype(next_obs, obs_dtype),
+            as_dtype(terminated, jnp.bool_),
         )
         pending.append(transition)
         if len(pending) >= fill_batch_size:
+            if prof:
+                t_sec = time.perf_counter()
             buffer_state = flush_pending(pending, buffer_state)
+            if prof:
+                prof.add("warmup/replay_add", t_sec, buffer_state)
             pending = []
         obs = next_obs
 
@@ -666,6 +803,7 @@ def single_run(config: dict):
     train_pending = []
 
     def flush_train_pending(pending, buffer_state):
+        nonlocal buffer_num_added
         if not pending:
             return buffer_state
         batch = Transition(
@@ -676,6 +814,7 @@ def single_run(config: dict):
             done=jnp.stack([t.done for t in pending], axis=0),
         )
         batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
+        buffer_num_added += len(pending) * num_envs
         return buffer_add(buffer_state, batch)
 
     total_iterations = total_timesteps // (num_envs * config["SCAN_STEPS"]) + 1
@@ -689,28 +828,48 @@ def single_run(config: dict):
         rtpt.step()
 
         for local_step in range(steps_per_iteration):
-            key, subkey = jax.random.split(key)
-            action, key = sample_action(encoder_state, actor_state, obs, subkey)
+            if prof:
+                t_sec = time.perf_counter()
+            action, key = sample_action(encoder_state, actor_state, obs, key)
+            if prof:
+                prof.add("action_sample", t_sec, action)
 
+            if prof:
+                t_sec = time.perf_counter()
             next_obs, env_state, reward, terminated, next_done, info = vmap_step(env_state, action)
+            if prof:
+                prof.add("env_step", t_sec, next_obs)
 
+            if prof:
+                t_sec = time.perf_counter()
             obs_dtype = jnp.uint8 if config["PIXEL_BASED"] else jnp.float32
             transition = Transition(
-                obs.astype(obs_dtype),
-                action.astype(jnp.float32),
-                reward.astype(jnp.float32),
-                next_obs.astype(obs_dtype),
-                terminated.astype(jnp.bool_),
+                as_dtype(obs, obs_dtype),
+                as_dtype(action, jnp.float32),
+                as_dtype(reward, jnp.float32),
+                as_dtype(next_obs, obs_dtype),
+                as_dtype(terminated, jnp.bool_),
             )
+            if prof:
+                prof.add("transition_build", t_sec, transition)
+
             train_pending.append(transition)
             if len(train_pending) >= train_add_batch_size:
+                if prof:
+                    t_sec = time.perf_counter()
                 buffer_state = flush_train_pending(train_pending, buffer_state)
+                if prof:
+                    prof.add("replay_add", t_sec, buffer_state)
                 train_pending = []
 
             obs = next_obs
             global_step += num_envs
 
-            if buffer_can_sample(buffer_state):
+            # `can_sample_count` is the host-side equivalent of buffer.can_sample(state)
+            # (see its definition); it avoids a JIT dispatch + device sync per step.
+            if can_sample_count(buffer_num_added):
+                if prof:
+                    t_sec = time.perf_counter()
                 key, sample_key = jax.random.split(key)
                 batch = buffer_sample(buffer_state, sample_key).experience
                 batch = Transition(
@@ -720,8 +879,13 @@ def single_run(config: dict):
                     remove_env_dim(batch.next_obs),
                     remove_env_dim(batch.done),
                 )
+                if prof:
+                    prof.add("replay_sample", t_sec, batch)
+
+                if prof:
+                    t_sec = time.perf_counter()
                 if buffer_on_cpu:
-                    batch = jax.device_put(batch, jax.devices("gpu")[0])
+                    batch = jax.device_put(batch, compute_device)
                 batch = Transition(
                     batch.obs.astype(jnp.float32),
                     batch.action.astype(jnp.float32),
@@ -729,12 +893,16 @@ def single_run(config: dict):
                     batch.next_obs.astype(jnp.float32),
                     batch.done.astype(jnp.float32),
                 )
+                if prof:
+                    prof.add("h2d_and_float_cast", t_sec, batch)
 
                 if config["AUTOTUNE"]:
                     current_alpha = jnp.exp(alpha_state.params["log_alpha"]).squeeze()
                 else:
                     current_alpha = config["ALPHA"]
 
+                if prof:
+                    t_sec = time.perf_counter()
                 (encoder_state, qf1_state, qf2_state, qf_loss, qf1_loss, qf2_loss,
                  qf1_values, qf2_values, next_q_values,
                  qf1_grad_norm, qf2_grad_norm,
@@ -743,9 +911,14 @@ def single_run(config: dict):
                     encoder_target_params, qf1_target_params, qf2_target_params,
                     current_alpha, batch, key,
                 )
+                if prof:
+                    prof.add("critic_update", t_sec,
+                             (encoder_state, qf1_state, qf2_state, qf_loss, qf1_values, qf2_values))
 
                 # Single actor update on delay
                 if global_step % config["POLICY_FREQUENCY"] == 0:
+                    if prof:
+                        t_sec = time.perf_counter()
                     (
                         encoder_state,
                         actor_state,
@@ -760,6 +933,9 @@ def single_run(config: dict):
                         encoder_state, actor_state, qf1_state, qf2_state,
                         alpha_state, current_alpha, batch, key,
                     )
+                    if prof:
+                        prof.add("actor_update", t_sec,
+                                 (encoder_state, actor_state, alpha_state, actor_loss))
                 else:
                     actor_loss = jnp.array(0.0)
                     log_prob_mean = jnp.array(0.0)
@@ -767,17 +943,22 @@ def single_run(config: dict):
                     actor_grad_norm = jnp.array(0.0)
 
                 if global_step % config["TARGET_NETWORK_FREQUENCY"] == 0:
+                    if prof:
+                        t_sec = time.perf_counter()
                     encoder_target_params, qf1_target_params, qf2_target_params, actor_target_params = target_update(
                         encoder_state, qf1_state, qf2_state,
                         encoder_target_params, qf1_target_params, qf2_target_params,
                         actor_state, actor_target_params, config["TAU"],
                     )
+                    if prof:
+                        prof.add("target_update", t_sec,
+                                 (encoder_target_params, qf1_target_params, qf2_target_params))
 
         buffer_state = flush_train_pending(train_pending, buffer_state)
         train_pending = []
 
         # Logging inside safe sample check context
-        if iteration % 1 == 0 and buffer_can_sample(buffer_state):
+        if iteration % 1 == 0 and can_sample_count(buffer_num_added):
             avg_return = info["returned_episode_returns"].mean() if "returned_episode_returns" in info else 0.0
             avg_length = info["returned_episode_lengths"].mean() if "returned_episode_lengths" in info else 0.0
 
@@ -812,6 +993,24 @@ def single_run(config: dict):
 
         if config.get("EVAL_DURING_TRAIN", False) and iteration > 0 and iteration % config.get("EVAL_EVERY", 50) == 0:
             save_and_eval(iteration, encoder_state, actor_state, qf1_state, qf2_state)
+
+    if prof is not None:
+        LAST_PROFILE = prof
+        print(
+            prof.summary(
+                steps=global_step,
+                wall_s=time.time() - start_time,
+                title=(
+                    f"[SAC_PROFILE] TRANSITIONS={global_step} BATCH_SIZE={config['BATCH_SIZE']} "
+                    f"TRAIN_ADD_BATCH_SIZE={train_add_batch_size} "
+                    f"POLICY_FREQUENCY={config['POLICY_FREQUENCY']} "
+                    f"TARGET_NETWORK_FREQUENCY={config['TARGET_NETWORK_FREQUENCY']} "
+                    f"BUFFER_SIZE={config['BUFFER_SIZE']} BUFFER_ON_CPU={buffer_on_cpu} "
+                    f"PIXEL_BASED={config['PIXEL_BASED']} NUM_ENVS={num_envs} "
+                    f"compute_device={compute_device}"
+                ),
+            )
+        )
 
     print("Evaluating final model ...")
     metrics = save_and_eval(iteration + 1, encoder_state, actor_state, qf1_state, qf2_state)
