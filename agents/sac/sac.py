@@ -75,6 +75,48 @@ def get_gpu_stats():
 # ---------------------------------------------------------------------------
 PROFILE_ENABLED = os.environ.get("SAC_PROFILE", "").strip().lower() in ("1", "true", "yes", "on")
 
+# ---------------------------------------------------------------------------
+# Placement diagnostic (opt-in via SAC_DIAG_PLACEMENT=1).
+#
+# Prints where the replay buffer, the jitted replay ops and the sampled batch
+# actually live. It reads array *metadata* only (`Array.devices()`, `.shape`,
+# `.dtype`): no `jax.device_get`, so no device->host copy, no synchronisation and
+# no change to the computation (unlike SAC_PROFILE, it does not even serialise
+# the pipeline). Each tag is printed at most once -- startup / warmup / first
+# training step -- and each instrumented site costs one dict lookup per call.
+#
+# Read the output with these two facts in mind:
+#   * a jitted function is compiled for the device its arguments live on (unless
+#     it is pinned with `jax.jit(..., device=...)`), and its outputs are placed on
+#     that same device; so the device printed for an op's *output* is the device
+#     the op executed on;
+#   * `jax.device_put(x, None)` is a no-op: it returns `x` unchanged, on whatever
+#     device it already occupies (it does *not* mean "the default device").
+# ---------------------------------------------------------------------------
+PLACEMENT_DIAG = os.environ.get("SAC_DIAG_PLACEMENT", "").strip().lower() in ("1", "true", "yes", "on")
+_DIAG_SEEN = set()
+
+
+def diag_placement(tag, pytree, extra=""):
+    """One-shot, metadata-only report of where a pytree's leaves live."""
+    if not PLACEMENT_DIAG or tag in _DIAG_SEEN:
+        return
+    _DIAG_SEEN.add(tag)
+    leaves = list(jax.tree.leaves(pytree)) if pytree is not None else []
+    totals = {}
+    for i, leaf in enumerate(leaves):
+        devs = [str(d) for d in leaf.devices()]
+        totals["/".join(devs)] = totals.get("/".join(devs), 0) + 1
+        if i < 10:
+            print(f"[{tag}] {i} device= {devs} shape= {leaf.shape} dtype= {leaf.dtype}")
+    if len(leaves) > 10:
+        print(f"[{tag}] ... {len(leaves) - 10} more leaves")
+    print(f"[{tag}] leaves={len(leaves)} by device: "
+          + ", ".join(f"{k} x{v}" for k, v in sorted(totals.items())))
+    if extra:
+        print(f"[{tag}] {extra}")
+
+
 # Populated by `single_run` when profiling is enabled, so benchmark scripts can
 # read the breakdown programmatically.
 LAST_PROFILE = None
@@ -690,6 +732,38 @@ def single_run(config: dict):
         add_sequences=False,
     )
     buffer_state = buffer.init(dummy_transition)
+    # Q1/Q2: which device holds the replay state, and which device each storage leaf lives on.
+    # flashbax's `init` builds `experience` from the dummy transition (so it follows the dummy's
+    # device) but creates `is_full`/`current_index` as *fresh* scalars (so they follow the default
+    # device) -- on a GPU host those two can therefore start out on the GPU even with
+    # BUFFER_ON_CPU=True; the first `buffer_add` (pinned to the CPU in that branch) returns the
+    # whole state on the CPU, so the mixed placement is an init-time effect only.
+    diag_placement(
+        "REPLAY BUFFER", buffer_state,
+        extra=(f"BUFFER_ON_CPU={buffer_on_cpu} cpu_device={cpu_device} "
+               f"compute_device={compute_device} default_backend={jax.default_backend()} "
+               f"jax.devices()={jax.devices()} || jit form: "
+               + ("jax.jit(buffer.add, device=cpu_device, donate_argnums=(0,)) / "
+                  "jax.jit(buffer.sample, device=cpu_device)" if buffer_on_cpu else
+                  "jax.jit(buffer.add, donate_argnums=(0,)) / jax.jit(buffer.sample) "
+                  "(no device pin -> follows the state's device)")),
+    )
+
+    # Q-network/update placement: the update functions (`update_qf`,
+    # `update_actor_and_alpha`, `target_update`, `sample_action`) are plain `@jax.jit` with no
+    # `device=` pin, so they execute on whatever device their arguments live on -- i.e. the
+    # params printed here. On a GPU host that is the GPU even when BUFFER_ON_CPU=True, and with
+    # BUFFER_ON_CPU=False the batch is already there (see BATCH FOR UPDATES), so the hop happens
+    # only in the buffer_on_cpu returning path.
+    diag_placement(
+        "NETWORK PARAMS",
+        [encoder_state.params, qf1_state.params, qf2_state.params, actor_state.params]
+        + ([alpha_state.params] if alpha_state is not None else [])
+        + [encoder_target_params, qf1_target_params, qf2_target_params, actor_target_params],
+        extra=(f"compute_device={compute_device}; update/action jits are unpinned @jax.jit -> "
+               f"they run where these params live; env ops run on jax.default_backend()="
+               f"{jax.default_backend()}"),
+    )
 
     # ---------------------------------------------------------------------------
     # Replay buffer access.
@@ -814,6 +888,11 @@ def single_run(config: dict):
             done=jnp.stack([t.done for t in pending], axis=0),
         )
         batch = jax.tree.map(lambda x: jax.device_put(x, cpu_device), batch)
+        # Q6: with BUFFER_ON_CPU=False, cpu_device is None -> `jax.device_put(x, None)` is a no-op:
+        # the batch stays where the env produced it (the default/compute device). With
+        # BUFFER_ON_CPU=True it is an explicit copy onto the pinned CPU device.
+        diag_placement("REPLAY FLUSH BATCH", batch,
+                       extra=f"after `jax.device_put(x, cpu_device)` with cpu_device={cpu_device}")
         buffer_num_added += len(pending) * num_envs
         return buffer_add(buffer_state, batch)
 
@@ -839,6 +918,11 @@ def single_run(config: dict):
             next_obs, env_state, reward, terminated, next_done, info = vmap_step(env_state, action)
             if prof:
                 prof.add("env_step", t_sec, next_obs)
+            # Q-env: the device the environment rollout lives on (env jits are unpinned, so this
+            # is the default backend's device -- the GPU on a GPU host).
+            diag_placement("ENV STEP OBS", (next_obs, reward, action),
+                           extra=f"jax.default_backend()={jax.default_backend()} "
+                                 f"jax.devices()={jax.devices()}")
 
             if prof:
                 t_sec = time.perf_counter()
@@ -860,6 +944,12 @@ def single_run(config: dict):
                 buffer_state = flush_train_pending(train_pending, buffer_state)
                 if prof:
                     prof.add("replay_add", t_sec, buffer_state)
+                # Q3: the device of the state *returned* by jitted `buffer.add` is the device the
+                # add executed on (an un-pinned jit follows its arguments; the pinned variant is
+                # forced onto cpu_device).
+                diag_placement("REPLAY ADD STATE OUT", buffer_state,
+                               extra="state returned by the jitted buffer.add "
+                                     "(its device == the device add executed on)")
                 train_pending = []
 
             obs = next_obs
@@ -872,6 +962,10 @@ def single_run(config: dict):
                     t_sec = time.perf_counter()
                 key, sample_key = jax.random.split(key)
                 batch = buffer_sample(buffer_state, sample_key).experience
+                # Q4/Q5: device of the sampled batch, straight out of the jitted buffer.sample,
+                # before any remove_env_dim / cast / device_put touches it.
+                diag_placement("REPLAY SAMPLE", batch,
+                               extra="raw output of the jitted buffer.sample(...).experience")
                 batch = Transition(
                     remove_env_dim(batch.obs),
                     remove_env_dim(batch.action),
@@ -895,6 +989,12 @@ def single_run(config: dict):
                 )
                 if prof:
                     prof.add("h2d_and_float_cast", t_sec, batch)
+                # Q6/transfer site: the device the gradient updates will consume. Compare with
+                # REPLAY SAMPLE: a different device here means a replay -> updates transfer
+                # happened, and it happened in the `if buffer_on_cpu: device_put(...)` line above.
+                diag_placement("BATCH FOR UPDATES", batch,
+                               extra=(f"after `if buffer_on_cpu: batch = jax.device_put(batch, "
+                                      f"compute_device)` (buffer_on_cpu={buffer_on_cpu}) + float cast"))
 
                 if config["AUTOTUNE"]:
                     current_alpha = jnp.exp(alpha_state.params["log_alpha"]).squeeze()
@@ -914,6 +1014,12 @@ def single_run(config: dict):
                 if prof:
                     prof.add("critic_update", t_sec,
                              (encoder_state, qf1_state, qf2_state, qf_loss, qf1_values, qf2_values))
+                # Q7: where the gradient update actually executed -- update_qf is an unpinned
+                # @jax.jit, so its outputs land on the device it ran on. Should match
+                # NETWORK PARAMS and BATCH FOR UPDATES.
+                diag_placement("UPDATE QF OUT", (encoder_state, qf1_state, qf2_state, qf_loss),
+                               extra="outputs of the jitted update_qf (= the device the critic "
+                                     "update executed on; must equal NETWORK PARAMS device)")
 
                 # Single actor update on delay
                 if global_step % config["POLICY_FREQUENCY"] == 0:
