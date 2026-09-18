@@ -36,7 +36,7 @@ from rtpt import RTPT
 from agents.sac.sac_eval import evaluate
 
 
-LOG_ALPHA_MIN = -1.0   # alpha >= ~0.135
+LOG_ALPHA_MIN = -5.0   # alpha >= ~0.135
 LOG_ALPHA_MAX = 5.0    # alpha <= ~148
 
 
