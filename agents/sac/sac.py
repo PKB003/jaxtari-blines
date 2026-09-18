@@ -61,7 +61,7 @@ def get_gpu_stats():
 
 
 # ---------------------------------------------------------------------------
-# Measurement-only section profiler (opt-in via SAC_PROFILE=1).
+# Optional performance instrumentation for benchmarking. (opt-in via SAC_PROFILE=1).
 #
 # It wraps the training-loop sections in `jax.block_until_ready` so that wall
 # time can be attributed to a specific section instead of to "whatever the async
@@ -326,7 +326,6 @@ def single_run(config: dict):
     shared_encoder = encoder_cls()
     actor = Actor(action_dim=action_dim)
     qf1, qf2 = SoftQNetwork(), SoftQNetwork()
-    qf1_target, qf2_target = SoftQNetwork(), SoftQNetwork()
 
     sample_obs = jnp.zeros((1,) + obs_space.shape, dtype=jnp.uint8 if config["PIXEL_BASED"] else jnp.float32)
     dummy_action = jnp.zeros((1, action_dim), dtype=jnp.float32)
@@ -397,12 +396,6 @@ def single_run(config: dict):
         return action_bias + action_scale * jnp.tanh(mean)
 
     # ---------- JIT functions ----------
-    # NOTE (perf): the key split that used to happen inline in the training loop is folded
-    # into this function so that one environment step costs a single dispatch instead of two.
-    # The split order -- and therefore the exact PRNG stream -- is unchanged:
-    #   before: key, subkey = split(key);  action, key = sample_action(..., subkey)
-    #           (sample_action internally did: key, subkey = split(subkey))
-    #   after : key, subkey = split(key);  key, action_key = split(subkey)
     @jax.jit
     def sample_action(encoder_state, actor_state, obs, key):
         key, subkey = jax.random.split(key)
@@ -426,10 +419,7 @@ def single_run(config: dict):
         return x
 
     def as_dtype(x, dtype):
-        """Cast ``x`` to ``dtype`` without dispatching a no-op op when the dtype already
-        matches. ``astype`` on an already-matching dtype still enqueues a copy on the
-        device; the resulting values are identical, so skipping it is behaviour-preserving
-        and removes one device dispatch per transition field."""
+        """Avoid an unnecessary device dispatch when ``x`` already has ``dtype``."""
         return x if x.dtype == dtype else x.astype(dtype)
 
     def _g_norm(*pytrees):
@@ -446,12 +436,12 @@ def single_run(config: dict):
         alpha, batch, key,
     ):
 
-        # Standard SAC: sample next action from ONLINE actor
+        # Sample the next action from the online actor.
         next_hidden = shared_encoder.apply(encoder_state.params, batch.next_obs)
         next_mean, next_log_std = actor.apply(actor_state.params, next_hidden)
         key, subkey = jax.random.split(key)
         next_action, next_log_prob, _ = sample_env_action(next_mean, next_log_std, subkey)
-
+        # Evaluate target Q-functions with the target encoder, reducing target drift
         z_next = shared_encoder.apply(encoder_target_params, batch.next_obs)
         qf1_next_target = qf1.apply(qf1_target_params, z_next, next_action).squeeze(-1)
         qf2_next_target = qf2.apply(qf2_target_params, z_next, next_action).squeeze(-1)
@@ -663,10 +653,6 @@ def single_run(config: dict):
     buffer_on_cpu = config.get("BUFFER_ON_CPU", True)
     cpu_device = jax.devices("cpu")[0] if buffer_on_cpu else None
 
-    # Device that runs the network updates. The old code called `jax.devices("gpu")[0]` on
-    # *every* training step; the lookup is static, so resolve it once. Behaviour on a GPU
-    # host is unchanged (still prefers the GPU); on a GPU-less host it now falls back to the
-    # default device instead of raising.
     try:
         compute_device = jax.devices("gpu")[0]
     except RuntimeError:
@@ -694,19 +680,9 @@ def single_run(config: dict):
     # ---------------------------------------------------------------------------
     # Replay buffer access.
     #
-    # `buffer_add` donates the old buffer state (donate_argnums=(0,)): flashbax's `add`
-    # is a pure function, so the returned state is bit-for-bit identical, but XLA is now
-    # allowed to update the (multi-GB) replay experience arrays *in place* instead of
-    # allocating and writing a full copy of them on every call. This is the same pattern
-    # flashbax uses in its own tests (jax.jit(buffer.add, donate_argnums=0)).
-    #
-    # Invariant required by donation: the donated state must not be *read* afterwards.
-    # The only reader is `buffer_sample`, which is always dispatched before the next
-    # `buffer_add` on the same device (all replay ops share the CPU device when
-    # BUFFER_ON_CPU=True), so the reader has completed by the time the donation runs.
-    # `buffer_can_sample` used to be a *host-side* reader called on every step; it has
-    # been replaced by `can_sample_count` (see below), which removes both a per-step
-    # dispatch/sync and that reader.
+    # Donate the old state on add so XLA can reuse replay storage in place.
+    # The old state must not be read after donation; sampling is dispatched
+    # before the next add, so this ordering is safe.
     # ---------------------------------------------------------------------------
     max_buffer_length = config["BUFFER_SIZE"]
     min_buffer_length = config["BATCH_SIZE"]
@@ -723,24 +699,14 @@ def single_run(config: dict):
         buffer_add = jax.jit(buffer.add, donate_argnums=(0,))
         buffer_sample = jax.jit(buffer.sample)
 
-    # Host-side equivalent of buffer.can_sample(state).
-    #
-    # flashbax implements `can_sample` as
-    #     state.is_full | (state.current_index >= min_length)
-    # where, after `n` transitions have been added,
-    #     is_full       == (n >= max_length)
-    #     current_index == n % max_length
-    # so the predicate is a pure function of the number of transitions added so far.
-    # It is monotone (once True it stays True), which is why tracking the count in Python
-    # is exactly equivalent to calling the (JIT-compiled, host-synchronising)
-    # `buffer.can_sample` on every step.
     def can_sample_count(n_added):
         return n_added >= max_buffer_length or (n_added % max_buffer_length) >= min_buffer_length
 
     buffer_num_added = 0
 
-    # Measurement-only (SAC_PROFILE=1): see the SectionProfiler docstring. `None`
-    # in normal runs, in which case the instrumented sites below are a no-op.
+    # Optional benchmark instrumentation (SAC_PROFILE=1); disabled in normal runs.
+    # Profiling synchronizes measured sections, so timings are diagnostic only
+    # and may differ from normal asynchronous execution.
     global LAST_PROFILE
     prof = SectionProfiler() if PROFILE_ENABLED else None
     if prof is not None:
@@ -865,8 +831,6 @@ def single_run(config: dict):
             obs = next_obs
             global_step += num_envs
 
-            # `can_sample_count` is the host-side equivalent of buffer.can_sample(state)
-            # (see its definition); it avoids a JIT dispatch + device sync per step.
             if can_sample_count(buffer_num_added):
                 if prof:
                     t_sec = time.perf_counter()
