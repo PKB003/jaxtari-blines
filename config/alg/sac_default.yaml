@@ -25,6 +25,19 @@ TARGET_NETWORK_FREQUENCY: 1
 
 REWARD_SCALE_FACTOR: 10.0
 
+# Alpha (entropy coefficient) autotune: soft penalty range for the learned log_alpha.
+# alpha = exp(log_alpha) is softly encouraged to stay within
+# [exp(LOG_ALPHA_MIN), exp(LOG_ALPHA_MAX)] via a quadratic penalty in the alpha loss.
+
+# Personal preference: -1.0 gives behavior that feels smoother and
+# more human-like to me in qualitative evaluation. Alpha below 0.368
+# incurs a penalty; in practice, alpha typically stays above ~0.066
+# and remains mostly around 0.075.  A lower bound can be chosen to
+# give the agent more freedom to adjust alpha.
+LOG_ALPHA_MIN: -1.0
+
+LOG_ALPHA_MAX: 5.0
+
 # Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
 # Set to False to keep it on GPU (faster but uses much more VRAM).
 BUFFER_ON_CPU: True

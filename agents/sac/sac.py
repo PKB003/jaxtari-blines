@@ -35,11 +35,7 @@ from jaxatari import spaces
 from rtpt import RTPT
 from agents.sac.sac_eval import evaluate
 
-
-LOG_ALPHA_MIN = -5.0   # alpha >= ~0.135
-LOG_ALPHA_MAX = 5.0    # alpha <= ~148
-
-
+# Optional benchmark tool
 def get_gpu_stats():
     """Return (memory_used_MB, memory_total_MB, utilization_percent) for the first GPU."""
     try:
@@ -310,6 +306,11 @@ def single_run(config: dict):
     action_bias = (high + low) / 2.0
 
     reward_scale = float(config.get("REWARD_SCALE_FACTOR", 10.0))
+    # Soft penalty bounds for log-alpha; the farther it goes beyond a bound,
+    # the stronger the force pulling it back (the penalty grows quadratically
+    # as log-alpha moves beyond either bound).
+    log_alpha_min = float(config.get("LOG_ALPHA_MIN", -5.0))
+    log_alpha_max = float(config.get("LOG_ALPHA_MAX", 5.0))
 
     @jax.jit
     def vmap_reset(key):
@@ -513,8 +514,8 @@ def single_run(config: dict):
             def alpha_loss_fn(alpha_params):
                 log_alpha = alpha_params["log_alpha"]
                 alpha_value = jnp.exp(log_alpha)
-                below = jnp.maximum(LOG_ALPHA_MIN - log_alpha, 0.0)
-                above = jnp.maximum(log_alpha - LOG_ALPHA_MAX, 0.0)
+                below = jnp.maximum(log_alpha_min - log_alpha, 0.0)
+                above = jnp.maximum(log_alpha - log_alpha_max, 0.0)
                 range_penalty = jnp.mean(below ** 2) + jnp.mean(above ** 2)
                 alpha_loss = -(alpha_value * (log_prob_alpha + target_entropy)).mean() + 0.1 * range_penalty
                 return alpha_loss
