@@ -127,8 +127,7 @@ def make_env(
     pixel_based: bool = True,
     native_downscaling: bool = True,
     eval: bool = False,
-    continuous_action: bool = True,
-    tau: float = 0.5,
+    tau_cale: float = 0.5,
 ):
     if mods is None:
         mods = []
@@ -144,7 +143,7 @@ def make_env(
             episodic_life=not eval,
             first_fire=True,
             noop_max=30,
-            full_action_space=continuous_action,
+            full_action_space= True,
         )
 
         if pixel_based:
@@ -173,8 +172,7 @@ def make_env(
             )
 
         env = LogWrapper(env)
-        if continuous_action:
-            env = ContinuousActionWrapper(env, tau=tau)
+        env = ContinuousActionWrapper(env, tau=tau_cale)
 
         return env
     return thunk
@@ -294,6 +292,7 @@ def single_run(config: dict):
         config["PIXEL_BASED"],
         config.get("NATIVE_DOWNSCALING", True),
         False,
+        config.get("TAU_CALE",0.5)
     )()
     obs_space = env.observation_space()
     assert isinstance(obs_space, spaces.Box), "SAC requires Box observation space."
@@ -620,6 +619,7 @@ def single_run(config: dict):
                         pixel_based=config["PIXEL_BASED"],
                         native_downscaling=config["NATIVE_DOWNSCALING"],
                         eval=True,
+                        tau_cale=config["TAU_CALE"],
                     ),
                     config["ENV_ID"],
                     eval_episodes=10,

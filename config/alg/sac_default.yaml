@@ -38,6 +38,10 @@ LOG_ALPHA_MIN: -1.0
 
 LOG_ALPHA_MAX: 5.0
 
+# CALE joystick deadzone threshold.
+# Values within this range are treated as zero to avoid unintended small inputs.
+TAU_CALE: 0.5
+
 # Keep the replay buffer on CPU to avoid exhausting GPU VRAM.
 # Set to False to keep it on GPU (faster but uses much more VRAM).
 BUFFER_ON_CPU: True
