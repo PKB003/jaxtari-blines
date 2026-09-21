@@ -97,10 +97,10 @@ def evaluate(
     episodic_returns = jnp.sum(masked_rewards, axis=0)
     print(f"Evaluated {eval_episodes} episodes, mean return: {episodic_returns.mean():.2f}, std return: {episodic_returns.std():.2f}")
 
-    # Robust slice of environment states for video logging (Episode 0)
+    # Robust slice of environment states for video logging (Episode 0).
     first_done_idx = jnp.argmax(dones[:, 0])
     has_done = jnp.any(dones[:, 0])
-    slice_end = jnp.where(has_done, first_done_idx + 1, dones.shape[0])
+    slice_end = int(jax.device_get(jnp.where(has_done, first_done_idx + 1, dones.shape[0])))
     env_states_until_done = jax.tree.map(lambda x: x[:slice_end], first_states)
 
     raw_env_states_until_done = env_states_until_done.atari_state.atari_state.env_state

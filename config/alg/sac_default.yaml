@@ -53,3 +53,7 @@ FILL_BATCH_SIZE: 256
 # Accumulating a few transitions on GPU and flushing them together reduces
 # the number of expensive buffer.add calls by a factor of TRAIN_ADD_BATCH_SIZE.
 TRAIN_ADD_BATCH_SIZE: 32
+
+# max number of frames per eval video; bounds the memory used while rendering
+# (1800 frames = 60s at 30fps, enough to inspect an episode)
+VIDEO_MAX_FRAMES: 1800

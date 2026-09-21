@@ -263,6 +263,43 @@ class Transition:
     done: jnp.ndarray  # Stores true env termination (terminated)
 
 
+def render_env_states(env_states, env_id, mods=None, chunk_size=256, max_frames=None):
+    """Render a batch of env states into a (T, C, H, W) uint8 array for wandb.Video."""
+    import jaxatari
+
+    renderer = jaxatari.make(env_id, mods=mods).renderer
+    # Every array leaf is stacked along the same frame axis; scalar leaves are ignored.
+    lengths = [
+        int(leaf.shape[0])
+        for leaf in jax.tree_util.tree_leaves(env_states)
+        if getattr(leaf, "ndim", 0) > 0
+    ]
+    if not lengths:
+        return None
+
+    num_frames = max(lengths)
+    if max_frames is not None:
+        num_frames = min(num_frames, int(max_frames))
+    if num_frames <= 0:
+        return None
+
+    chunks = None
+    offset = 0
+    for start in range(0, num_frames, chunk_size):
+        stop = min(start + chunk_size, num_frames)
+        chunk_states = jax.tree_util.tree_map(
+            lambda x: x[start:stop] if hasattr(x, "ndim") and x.ndim > 0 else x, env_states
+        )
+        frames = jax.vmap(renderer.render)(chunk_states)  # (t, H, W, C) on device
+        frames = np.asarray(jax.device_get(frames))       # host copy; device chunk can be reused
+        frames = frames.transpose(0, 3, 1, 2)             # (t, H, W, C) -> (t, C, H, W)
+        if chunks is None:  # single C-contiguous output buffer, no second copy
+            chunks = np.empty((num_frames,) + frames.shape[1:], dtype=frames.dtype)
+        chunks[offset:offset + frames.shape[0]] = frames
+        offset += frames.shape[0]
+    return chunks
+
+
 def single_run(config: dict):
     config = {k.upper(): v for k, v in config.items() if k != "alg"}
 
@@ -631,12 +668,15 @@ def single_run(config: dict):
                 wandb.log({f"eval/episodic_return_{mod_label}": mean_return}, step=iteration)
 
                 if config.get("CAPTURE_VIDEO", False):
-                    import jaxatari
-                    clean_renderer = jaxatari.make(config["ENV_ID"], mods=mods_config).renderer
-                    frames = jax.vmap(clean_renderer.render)(env_states)
-                    frames = jnp.transpose(frames, (0, 3, 1, 2))
-                    video = wandb.Video(np.array(frames), fps=30, format="mp4")
-                    wandb.log({f"eval/video_{mod_label}": video}, step=iteration)
+                    frames = render_env_states(
+                        env_states,
+                        config["ENV_ID"],
+                        mods=mods_config,
+                        max_frames=config.get("VIDEO_MAX_FRAMES", 1800),
+                    )
+                    if frames is not None:
+                        video = wandb.Video(frames, fps=30, format="mp4")
+                        wandb.log({f"eval/video_{mod_label}": video}, step=iteration)
             finally:
                 if tmp_path and os.path.exists(tmp_path):
                     os.remove(tmp_path)
