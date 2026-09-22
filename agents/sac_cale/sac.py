@@ -33,7 +33,7 @@ from jaxatari.wrappers import (
 from jaxatari import spaces
 
 from rtpt import RTPT
-from agents.sac.sac_eval import evaluate
+from agents.sac_cale.sac_eval import evaluate
 
 # Optional benchmark tool
 def get_gpu_stats():
